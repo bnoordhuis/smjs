@@ -2,3 +2,5 @@
 *.a
 *.mk
 *.Makefile
+/Makefile
+/out
