@@ -16,9 +16,26 @@
       },
     },
 
+    'direct_dependent_settings': {
+      'include_dirs': [
+        'extra/',
+        'src',
+      ],
+      'conditions': [
+        ['target_arch == "x64"', {
+          'defines': ['JS_BYTES_PER_WORD=8'],
+        }],
+        ['target_arch == "ia32"', {
+          'defines': ['JS_BYTES_PER_WORD=4'],
+        }],
+        ['target_arch == "arm"', {
+          'defines': ['JS_BYTES_PER_WORD=4'],
+        }],
+      ],
+    },
+
     'include_dirs': [
       '<(SHARED_INTERMEDIATE_DIR)',
-      'config/common',
       'extra/',
       'src',
       'src/assembler',
@@ -26,12 +43,13 @@
     ],
 
     'defines': [
-      'HAVE_VA_LIST_AS_ARRAY=0', # XXX arch/platform/ABI/compiler dependent...
+      'HAVE_VA_LIST_AS_ARRAY=1', # XXX arch/platform/ABI/compiler dependent...
       '__STDC_LIMIT_MACROS=1',
       'JS_MONOIC=1',
       'JS_POLYIC=1',
       'JS_METHODJIT=1',
       'JS_DEFAULT_JITREPORT_GRANULARITY=3',
+      'JSGC_INCREMENTAL=1',
     ],
 
     # XXX I have frankly no idea what JS_NUNBOX32 and JS_PUNBOX64 *really* do
