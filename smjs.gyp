@@ -65,7 +65,19 @@
       }],
       ['OS == "mac"', {
         'include_dirs': [ 'config/darwin' ],
-        'defines': [ 'JS_HAVE_MACHINE_ENDIAN_H=1' ],
+        'defines': [
+          'JS_HAVE_MACHINE_ENDIAN_H=1',
+          'XP_MACOSX=1',
+          'DARWIN=1',
+        ],
+        'conditions': [
+          ['target_arch == "x64"', {
+            'xcode_settings': {'ARCHS': [ 'x86_64' ]},
+          }],
+          ['target_arch == "ia32"', {
+            'xcode_settings': {'ARCHS': [ 'i386' ]},
+          }],
+        ],
       }],
       ['OS == "win"', {
         'include_dirs': [ 'config/windows' ],
@@ -177,6 +189,7 @@
       'sources': [
         'compat/compat.cpp',
         'js/src/MemoryMetrics.cpp',
+        'js/src/assembler/assembler/MacroAssemblerX86Common.cpp',
         'js/src/assembler/jit/ExecutableAllocator.cpp',
         'js/src/builtin/MapObject.cpp',
         'js/src/builtin/RegExp.cpp',

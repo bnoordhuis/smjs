@@ -2,5 +2,6 @@
 *.a
 *.mk
 *.Makefile
+/gyp-mac-tool
 /Makefile
 /out
