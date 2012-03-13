@@ -106,8 +106,54 @@
     },
 
     {
+      'target_name': 'jskwgen',
+      'type': 'executable',
+      'sources': [ 'js/src/jskwgen.cpp' ],
+    },
+
+    {
+      'target_name': 'jsoplengen',
+      'type': 'executable',
+      'sources': [ 'js/src/jsoplengen.cpp' ],
+    },
+
+    {
       'target_name': 'smjs',
       'type': 'static_library',
+
+      'dependencies': [
+        'jskwgen',
+        'jsoplengen',
+      ],
+
+      'actions': [
+        {
+          'action_name': 'jskwgen',
+          'inputs': [
+            '<(PRODUCT_DIR)/<(EXECUTABLE_PREFIX)jskwgen<(EXECUTABLE_SUFFIX)',
+          ],
+          'outputs': [
+            '<(SHARED_INTERMEDIATE_DIR)/jsautokw.h',
+          ],
+          'action': [
+            '<@(_inputs)',
+            '<@(_outputs)',
+          ],
+        },
+        {
+          'action_name': 'jsoplengen',
+          'inputs': [
+            '<(PRODUCT_DIR)/<(EXECUTABLE_PREFIX)jsoplengen<(EXECUTABLE_SUFFIX)',
+          ],
+          'outputs': [
+            '<(SHARED_INTERMEDIATE_DIR)/jsautooplen.h',
+          ],
+          'action': [
+            '<@(_inputs)',
+            '<@(_outputs)',
+          ],
+        },
+      ],
 
       'conditions': [
         ['OS == "win"', {
