@@ -8,11 +8,11 @@
 
     'configurations': {
       'Debug': {
-        'cflags': [ '-g', '-O0' ],
+        'cflags': ['-g', '-O0'],
       },
       'Release': {
-        'defines': [ 'NDEBUG' ],
-        'cflags': [ '-O3', '-fno-strict-aliasing' ],
+        'defines': ['NDEBUG'],
+        'cflags': ['-O3', '-fno-strict-aliasing'],
       },
     },
 
@@ -60,11 +60,11 @@
         ],
       }],
       ['OS == "linux"', {
-        'include_dirs': [ 'config/linux' ],
-        'defines': [ 'JS_HAVE_ENDIAN_H=1' ],
+        'include_dirs': ['config/linux'],
+        'defines': ['JS_HAVE_ENDIAN_H=1'],
       }],
       ['OS == "mac"', {
-        'include_dirs': [ 'config/darwin' ],
+        'include_dirs': ['config/darwin'],
         'defines': [
           'JS_HAVE_MACHINE_ENDIAN_H=1',
           'XP_MACOSX=1',
@@ -72,16 +72,16 @@
         ],
         'conditions': [
           ['target_arch == "x64"', {
-            'xcode_settings': {'ARCHS': [ 'x86_64' ]},
+            'xcode_settings': {'ARCHS': ['x86_64']},
           }],
           ['target_arch == "ia32"', {
-            'xcode_settings': {'ARCHS': [ 'i386' ]},
+            'xcode_settings': {'ARCHS': ['i386']},
           }],
         ],
       }],
       ['OS == "win"', {
-        'include_dirs': [ 'config/windows' ],
-        'defines': [ 'XP_WIN=1' ],
+        'include_dirs': ['config/windows'],
+        'defines': ['XP_WIN=1'],
       }, {
         'cflags': [
           # -Wno-invalid-offsetof disables warnings when offsetof() is used
@@ -104,7 +104,7 @@
     {
       'target_name': 'shell',
       'type': 'executable',
-      'dependencies': [ 'smjs' ],
+      'dependencies': ['smjs'],
       'include_dirs': [
         'js/src/shell',
         'js/src/perf',
@@ -120,13 +120,13 @@
     {
       'target_name': 'jskwgen',
       'type': 'executable',
-      'sources': [ 'js/src/jskwgen.cpp' ],
+      'sources': ['js/src/jskwgen.cpp'],
     },
 
     {
       'target_name': 'jsoplengen',
       'type': 'executable',
-      'sources': [ 'js/src/jsoplengen.cpp' ],
+      'sources': ['js/src/jsoplengen.cpp'],
     },
 
     {
@@ -180,9 +180,9 @@
           ],
         }],
         ['OS == "linux"', {
-          'sources': [ 'js/src/perf/pm_linux.cpp' ],
+          'sources': ['js/src/perf/pm_linux.cpp'],
         }, {
-          'sources': [ 'js/src/perf/pm_stub.cpp' ],
+          'sources': ['js/src/perf/pm_stub.cpp'],
         }],
       ],
 
