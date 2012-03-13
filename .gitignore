@@ -2,6 +2,11 @@
 *.a
 *.mk
 *.Makefile
+*.vcxproj
+*.vcxproj.filters
+*.sln
 /gyp-mac-tool
 /Makefile
 /out
+/Debug
+/Release

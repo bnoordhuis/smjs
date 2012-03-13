@@ -81,6 +81,7 @@
         ],
       }],
       ['OS == "win"', {
+        'msvs_cygwin_shell': 0, # don't use bash
         'include_dirs': ['config/windows'],
         'defines': ['XP_WIN=1'],
       }, {
