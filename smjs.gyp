@@ -16,141 +16,113 @@
       },
     },
 
+    # XXX not everything needs to be exported in direct_dependent_settings
     'direct_dependent_settings': {
       'include_dirs': [
+        '<(SHARED_INTERMEDIATE_DIR)',
         'extra/',
         'src',
+        'src/assembler',
+        'src/methodjit',
       ],
+
+      'defines': [
+        'HAVE_VA_LIST_AS_ARRAY=1', # XXX arch/platform/ABI/compiler dependent...
+        '__STDC_LIMIT_MACROS=1',
+        'JS_MONOIC=1',
+        'JS_POLYIC=1',
+        'JS_METHODJIT=1',
+        'JS_DEFAULT_JITREPORT_GRANULARITY=3',
+        'JSGC_INCREMENTAL=1',
+        'IMPL_MFBT=1',
+        # This implies building a static library
+        'STATIC_JS_API=1',
+      ],
+
+      # XXX I have frankly no idea what JS_NUNBOX32 and JS_PUNBOX64 *really* do
       'conditions': [
         ['target_arch == "x64"', {
-          'defines': ['JS_BYTES_PER_WORD=8'],
+          'defines': [
+            'JS_BITS_PER_WORD_LOG2=6',
+            'JS_BYTES_PER_WORD=8',
+            'JS_PUNBOX64=1',
+            'JS_CPU_X64=1',
+          ],
         }],
         ['target_arch == "ia32"', {
-          'defines': ['JS_BYTES_PER_WORD=4'],
+          'defines': [
+            'JS_BITS_PER_WORD_LOG2=5',
+            'JS_BYTES_PER_WORD=4',
+            'JS_NUNBOX32=1',
+            'JS_CPU_X86=1',
+          ],
         }],
         ['target_arch == "arm"', {
-          'defines': ['JS_BYTES_PER_WORD=4'],
+          'defines': [
+            'JS_BITS_PER_WORD_LOG2=5',
+            'JS_BYTES_PER_WORD=4',
+            'JS_NUNBOX32=1',
+            'JS_CPU_ARM=1',
+          ],
+        }],
+        ['OS == "linux"', {
+          'defines': ['JS_HAVE_ENDIAN_H=1'],
+        }],
+        ['OS == "mac"', {
+          'defines': [
+            'JS_HAVE_MACHINE_ENDIAN_H=1',
+            'XP_MACOSX=1',
+            'DARWIN=1',
+          ],
+          'conditions': [
+            ['target_arch == "x64"', {
+              'xcode_settings': {'ARCHS': ['x86_64']},
+            }],
+            ['target_arch == "ia32"', {
+              'xcode_settings': {'ARCHS': ['i386']},
+            }],
+          ],
+        }],
+        ['OS == "win"', {
+          'defines': [
+            'WIN32=1',
+            'XP_WIN=1',
+            'HAVE_GETSYSTEMTIMEASFILETIME=1',
+            'HAVE_SYSTEMTIMETOFILETIME=1',
+            'WIN32_LEAN_AND_MEAN=1',
+          ],
+          'conditions': [
+            ['target_arch == "ia32"', {
+              'defines': [
+                '_X86_=1'
+              ],
+            }],
+            ['target_arch == "x64"', {
+              'defines': [
+                '_AMD64_=1',
+                '_M_AMD64_=1'
+              ],
+            }],
+          ],
+          'msvs_cygwin_shell': 0, # don't use bash
+          'msvc_disable_warnings': [
+            '4800', # warning C4800: 'variable' : forcing value to bool 'true' or
+                    # 'false' (performance warning)
+          ],
+          'msvs_settings': {
+            'VCCLCompilerTool': {
+              'AdditionalOptions': [
+                '/MP', # compile across multiple CPUs
+              ],
+            },
+          }
+        }, {
+          'cflags': ['-pthread'],
+          'defines': ['XP_UNIX=1'],
+          'libraries': ['-pthread'],
         }],
       ],
     },
-
-    'include_dirs': [
-      '<(SHARED_INTERMEDIATE_DIR)',
-      'extra/',
-      'src',
-      'src/assembler',
-      'src/methodjit',
-    ],
-
-    'defines': [
-      'HAVE_VA_LIST_AS_ARRAY=1', # XXX arch/platform/ABI/compiler dependent...
-      '__STDC_LIMIT_MACROS=1',
-      'JS_MONOIC=1',
-      'JS_POLYIC=1',
-      'JS_METHODJIT=1',
-      'JS_DEFAULT_JITREPORT_GRANULARITY=3',
-      'JSGC_INCREMENTAL=1',
-      'IMPL_MFBT=1',
-      # This implies building a static library
-      'STATIC_JS_API=1',
-    ],
-
-    # XXX I have frankly no idea what JS_NUNBOX32 and JS_PUNBOX64 *really* do
-    'conditions': [
-      ['target_arch == "x64"', {
-        'defines': [
-          'JS_BITS_PER_WORD_LOG2=6',
-          'JS_BYTES_PER_WORD=8',
-          'JS_PUNBOX64=1',
-          'JS_CPU_X64=1',
-        ],
-      }],
-      ['target_arch == "ia32"', {
-        'defines': [
-          'JS_BITS_PER_WORD_LOG2=5',
-          'JS_BYTES_PER_WORD=4',
-          'JS_NUNBOX32=1',
-          'JS_CPU_X86=1',
-        ],
-      }],
-      ['target_arch == "arm"', {
-        'defines': [
-          'JS_BITS_PER_WORD_LOG2=5',
-          'JS_BYTES_PER_WORD=4',
-          'JS_NUNBOX32=1',
-          'JS_CPU_ARM=1',
-        ],
-      }],
-      ['OS == "linux"', {
-        'include_dirs': ['config/linux'],
-        'defines': ['JS_HAVE_ENDIAN_H=1'],
-      }],
-      ['OS == "mac"', {
-        'include_dirs': ['config/darwin'],
-        'defines': [
-          'JS_HAVE_MACHINE_ENDIAN_H=1',
-          'XP_MACOSX=1',
-          'DARWIN=1',
-        ],
-        'conditions': [
-          ['target_arch == "x64"', {
-            'xcode_settings': {'ARCHS': ['x86_64']},
-          }],
-          ['target_arch == "ia32"', {
-            'xcode_settings': {'ARCHS': ['i386']},
-          }],
-        ],
-      }],
-      ['OS == "win"', {
-        'include_dirs': ['config/windows'],
-        'defines': [
-          'WIN32=1',
-          'XP_WIN=1',
-          'HAVE_GETSYSTEMTIMEASFILETIME=1',
-          'HAVE_SYSTEMTIMETOFILETIME=1',
-          'WIN32_LEAN_AND_MEAN=1',
-        ],
-        'conditions': [
-          ['target_arch == "ia32"', {
-            'defines': [
-              '_X86_=1'
-            ],
-          }],
-          ['target_arch == "x64"', {
-            'defines': [
-              '_AMD64_=1',
-              '_M_AMD64_=1'
-            ],
-          }],
-        ],
-        'msvs_cygwin_shell': 0, # don't use bash
-        'msvc_disable_warnings': [
-          '4800', # warning C4800: 'variable' : forcing value to bool 'true' or
-                  # 'false' (performance warning)
-        ],
-        'msvs_settings': {
-          'VCCLCompilerTool': {
-            'AdditionalOptions': [
-              '/MP', # compile across multiple CPUs
-            ],
-          },
-        }
-      }, {
-        'cflags': [
-          # -Wno-invalid-offsetof disables warnings when offsetof() is used
-          # on non-POD types. This is obviously the wrong thing to do but the
-          # warnings drown out everything else....
-          '-Wno-invalid-offsetof',
-          '-pthread',
-        ],
-        'defines': [
-          'XP_UNIX=1',
-        ],
-        'libraries': [
-          '-pthread',
-        ],
-      }],
-    ],
   },
 
   'targets': [
