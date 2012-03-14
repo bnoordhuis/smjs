@@ -2,6 +2,17 @@
 *.a
 *.mk
 *.Makefile
+*.opensdf
+*.sdf
+*.sln
+*.suo
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+/build/gyp
+/Debug
 /gyp-mac-tool
+/ipch
 /Makefile
 /out
+/Release

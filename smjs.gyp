@@ -50,6 +50,9 @@
       'JS_METHODJIT=1',
       'JS_DEFAULT_JITREPORT_GRANULARITY=3',
       'JSGC_INCREMENTAL=1',
+      'IMPL_MFBT=1',
+      # This implies building a static library
+      'STATIC_JS_API=1',
     ],
 
     # XXX I have frankly no idea what JS_NUNBOX32 and JS_PUNBOX64 *really* do
@@ -100,7 +103,38 @@
       }],
       ['OS == "win"', {
         'include_dirs': ['config/windows'],
-        'defines': ['XP_WIN=1'],
+        'defines': [
+          'WIN32=1',
+          'XP_WIN=1',
+          'HAVE_GETSYSTEMTIMEASFILETIME=1',
+          'HAVE_SYSTEMTIMETOFILETIME=1',
+          'WIN32_LEAN_AND_MEAN=1',
+        ],
+        'conditions': [
+          ['target_arch == "ia32"', {
+            'defines': [
+              '_X86_=1'
+            ],
+          }],
+          ['target_arch == "x64"', {
+            'defines': [
+              '_AMD64_=1',
+              '_M_AMD64_=1'
+            ],
+          }],
+        ],
+        'msvs_cygwin_shell': 0, # don't use bash
+        'msvc_disable_warnings': [
+          '4800', # warning C4800: 'variable' : forcing value to bool 'true' or
+                  # 'false' (performance warning)
+        ],
+        'msvs_settings': {
+          'VCCLCompilerTool': {
+            'AdditionalOptions': [
+              '/MP', # compile across multiple CPUs
+            ],
+          },
+        }
       }, {
         'cflags': [
           # -Wno-invalid-offsetof disables warnings when offsetof() is used
@@ -188,9 +222,12 @@
 
       'conditions': [
         ['OS == "win"', {
+          'link_settings':  {
+            'libraries': [ '-lwinmm.lib' ],
+          },
           'sources': [
             'src/assembler/jit/ExecutableAllocatorWin.cpp',
-            'src/yarr/OSAllocatorPosix.cpp',
+            'src/yarr/OSAllocatorWin.cpp',
           ],
         }, {
           'sources': [
