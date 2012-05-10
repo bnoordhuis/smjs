@@ -704,7 +704,7 @@ mjit::Compiler::compileArrayConcat(types::TypeSet *thisTypes, types::TypeSet *ar
     templateObject->setType(thisType);
 
     RegisterID result = Registers::ReturnReg;
-    Jump emptyFreeList = masm.getNewObject(cx, result, templateObject);
+    Jump emptyFreeList = getNewObject(cx, result, templateObject);
     stubcc.linkExit(emptyFreeList, Uses(3));
 
     masm.storeValueFromComponents(ImmType(JSVAL_TYPE_OBJECT), result, frame.addressOf(frame.peek(-3)));
@@ -747,7 +747,7 @@ mjit::Compiler::compileArrayWithLength(uint32_t argc)
     templateObject->setType(type);
 
     RegisterID result = frame.allocReg();
-    Jump emptyFreeList = masm.getNewObject(cx, result, templateObject);
+    Jump emptyFreeList = getNewObject(cx, result, templateObject);
 
     stubcc.linkExit(emptyFreeList, Uses(0));
     stubcc.leave();
@@ -790,7 +790,7 @@ mjit::Compiler::compileArrayWithArgs(uint32_t argc)
     JS_ASSERT(templateObject->getDenseArrayCapacity() >= argc);
 
     RegisterID result = frame.allocReg();
-    Jump emptyFreeList = masm.getNewObject(cx, result, templateObject);
+    Jump emptyFreeList = getNewObject(cx, result, templateObject);
     stubcc.linkExit(emptyFreeList, Uses(0));
 
     int offset = JSObject::offsetOfFixedElements();
@@ -903,9 +903,6 @@ CompileStatus
 mjit::Compiler::inlineNativeFunction(uint32_t argc, bool callingNew)
 {
     if (!cx->typeInferenceEnabled())
-        return Compile_InlineAbort;
-
-    if (applyTricks == LazyArgsObj)
         return Compile_InlineAbort;
 
     FrameEntry *origCallee = frame.peek(-((int)argc + 2));
@@ -1033,7 +1030,9 @@ mjit::Compiler::inlineNativeFunction(uint32_t argc, bool callingNew)
         if (native == js::array_concat && argType == JSVAL_TYPE_OBJECT &&
             thisType == JSVAL_TYPE_OBJECT && type == JSVAL_TYPE_OBJECT &&
             !thisTypes->hasObjectFlags(cx, types::OBJECT_FLAG_NON_DENSE_ARRAY) &&
-            !argTypes->hasObjectFlags(cx, types::OBJECT_FLAG_NON_DENSE_ARRAY)) {
+            !argTypes->hasObjectFlags(cx, types::OBJECT_FLAG_NON_DENSE_ARRAY) &&
+            !types::ArrayPrototypeHasIndexedProperty(cx, outerScript))
+        {
             return compileArrayConcat(thisTypes, argTypes, thisValue, arg);
         }
     } else if (argc == 2) {

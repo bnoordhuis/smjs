@@ -73,6 +73,11 @@ class HashableValue {
     bool setValue(JSContext *cx, const Value &v);
     HashNumber hash() const;
     bool equals(const HashableValue &other) const;
+
+    struct StackRoot {
+        StackRoot(JSContext *cx, HashableValue *pv) : valueRoot(cx, (Value*) &pv->value) {}
+        RootValue valueRoot;
+    };
 };
 
 typedef HashMap<HashableValue, HeapValue, HashableValue::Hasher, RuntimeAllocPolicy> ValueMap;
@@ -87,7 +92,7 @@ class MapObject : public JSObject {
     static JSFunctionSpec methods[];
     ValueMap *getData() { return static_cast<ValueMap *>(getPrivate()); }
     static void mark(JSTracer *trc, JSObject *obj);
-    static void finalize(JSContext *cx, JSObject *obj);
+    static void finalize(FreeOp *fop, JSObject *obj);
     static JSBool construct(JSContext *cx, unsigned argc, Value *vp);
     static JSBool size(JSContext *cx, unsigned argc, Value *vp);
     static JSBool get(JSContext *cx, unsigned argc, Value *vp);
@@ -105,7 +110,7 @@ class SetObject : public JSObject {
     static JSFunctionSpec methods[];
     ValueSet *getData() { return static_cast<ValueSet *>(getPrivate()); }
     static void mark(JSTracer *trc, JSObject *obj);
-    static void finalize(JSContext *cx, JSObject *obj);
+    static void finalize(FreeOp *fop, JSObject *obj);
     static JSBool construct(JSContext *cx, unsigned argc, Value *vp);
     static JSBool size(JSContext *cx, unsigned argc, Value *vp);
     static JSBool has(JSContext *cx, unsigned argc, Value *vp);

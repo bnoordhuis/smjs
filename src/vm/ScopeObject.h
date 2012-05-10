@@ -42,9 +42,34 @@
 #ifndef ScopeObject_h___
 #define ScopeObject_h___
 
+#include "jscntxt.h"
 #include "jsobj.h"
 
 namespace js {
+
+/*
+ * A "scope coordinate" describes how to get from head of the scope chain to a
+ * given lexically-enclosing variable. A scope coordinate has two dimensions:
+ *  - hops: the number of scope objects on the scope chain to skip
+ *  - binding: which binding on the scope object
+ *
+ * XXX: Until bug 659577 lands, this is all for show and all ScopeCoordinates
+ * have hops fixed at 0 and 'binding' is just the js::Bindings binding for args
+ * and vars and the stack depth for let bindings. Thus, aliased-var access
+ * touches the StackFrame like it always did and 'binding' must be first
+ * converted to either an arg or local slot (using Bindings::bindingToLocal or
+ * bindingToArg). With bug 659577, ScopeObject will have a 'var' function that
+ * takes a ScopeCoordinate.
+ */
+struct ScopeCoordinate
+{
+    uint16_t hops;
+    uint16_t binding;
+    inline ScopeCoordinate(jsbytecode *pc);
+};
+
+inline JSAtom *
+ScopeCoordinateAtom(JSScript *script, jsbytecode *pc);
 
 /*
  * Scope objects
@@ -97,7 +122,7 @@ class ScopeObject : public JSObject
      * enclosing scope of a ScopeObject is necessarily non-null.
      */
     inline JSObject &enclosingScope() const;
-    inline bool setEnclosingScope(JSContext *cx, JSObject &obj);
+    inline bool setEnclosingScope(JSContext *cx, HandleObject obj);
 
     /*
      * The stack frame for this scope object, if the frame is still active.
@@ -113,10 +138,9 @@ class ScopeObject : public JSObject
 class CallObject : public ScopeObject
 {
     static const uint32_t CALLEE_SLOT = 1;
-    static const uint32_t ARGUMENTS_SLOT = 2;
 
     static CallObject *
-    create(JSContext *cx, JSScript *script, JSObject &enclosing, JSObject *callee);
+    create(JSContext *cx, JSScript *script, HandleObject enclosing, HandleObject callee);
 
   public:
     static const uint32_t RESERVED_SLOTS = 3;
@@ -134,15 +158,6 @@ class CallObject : public ScopeObject
     inline JSObject *getCallee() const;
     inline JSFunction *getCalleeFunction() const;
     inline void setCallee(JSObject *callee);
-
-    /*
-     * When a call object is created, CallObject::arguments has the value
-     * MagicValue(JS_UNASSIGNED_ARGUMENTS). This value is overwritten if:
-     *  1. js_PutCallObject is called in a frame which hasArgsObj
-     *  2. the script assigns to 'arguments'
-     */
-    inline const Value &arguments() const;
-    inline void setArguments(const Value &v);
 
     /* Returns the formal argument at the given index. */
     inline const Value &arg(unsigned i) const;
@@ -164,14 +179,13 @@ class CallObject : public ScopeObject
 
     inline void copyValues(unsigned nargs, Value *argv, unsigned nvars, Value *slots);
 
-    static JSBool getArgumentsOp(JSContext *cx, JSObject *obj, jsid id, Value *vp);
-    static JSBool setArgumentsOp(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value *vp);
     static JSBool getArgOp(JSContext *cx, JSObject *obj, jsid id, Value *vp);
     static JSBool getVarOp(JSContext *cx, JSObject *obj, jsid id, Value *vp);
-    static JSBool getUpvarOp(JSContext *cx, JSObject *obj, jsid id, Value *vp);
     static JSBool setArgOp(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value *vp);
     static JSBool setVarOp(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value *vp);
-    static JSBool setUpvarOp(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value *vp);
+
+    /* Return whether this environment contains 'name' and, if so, its value. */
+    bool containsVarOrArg(PropertyName *name, Value *vp, JSContext *cx);
 };
 
 class DeclEnvObject : public ScopeObject
@@ -206,7 +220,7 @@ class WithObject : public NestedScopeObject
     static const gc::AllocKind FINALIZE_KIND = gc::FINALIZE_OBJECT4;
 
     static WithObject *
-    create(JSContext *cx, StackFrame *fp, JSObject &proto, JSObject &enclosing, uint32_t depth);
+    create(JSContext *cx, StackFrame *fp, HandleObject proto, HandleObject enclosing, uint32_t depth);
 
     /* Return object for the 'this' class hook. */
     JSObject &withThis() const;
@@ -242,6 +256,7 @@ class StaticBlockObject : public BlockObject
     inline void setEnclosingBlock(StaticBlockObject *blockObj);
 
     void setStackDepth(uint32_t depth);
+    bool containsVarAtDepth(uint32_t depth);
 
     /*
      * Frontend compilation temporarily uses the object's slots to link
@@ -249,7 +264,13 @@ class StaticBlockObject : public BlockObject
      */
     void setDefinitionParseNode(unsigned i, Definition *def);
     Definition *maybeDefinitionParseNode(unsigned i);
-    void poisonDefinitionParseNode(unsigned i);
+
+    /*
+     * A let binding is aliased is accessed lexically by nested functions or
+     * dynamically through dynamic name lookup (eval, with, function::, etc).
+     */
+    void setAliased(unsigned i, bool aliased);
+    bool isAliased(unsigned i);
 
     const Shape *addVar(JSContext *cx, jsid id, int index, bool *redeclared);
 };
@@ -257,7 +278,7 @@ class StaticBlockObject : public BlockObject
 class ClonedBlockObject : public BlockObject
 {
   public:
-    static ClonedBlockObject *create(JSContext *cx, StaticBlockObject &block, StackFrame *fp);
+    static ClonedBlockObject *create(JSContext *cx, Handle<StaticBlockObject*> block, StackFrame *fp);
 
     /* The static block from which this block was cloned. */
     StaticBlockObject &staticBlock() const;
@@ -270,10 +291,18 @@ class ClonedBlockObject : public BlockObject
 
     /* Assuming 'put' has been called, return the value of the ith let var. */
     const Value &closedSlot(unsigned i);
+
+    /* Return whether this environment contains 'name' and, if so, its value. */
+    bool containsVar(PropertyName *name, Value *vp, JSContext *cx);
 };
 
-extern bool
-XDRStaticBlockObject(JSXDRState *xdr, JSScript *script, StaticBlockObject **objp);
+template<XDRMode mode>
+bool
+XDRStaticBlockObject(XDRState<mode> *xdr, JSScript *script, StaticBlockObject **objp);
+
+extern JSObject *
+CloneStaticBlockObject(JSContext *cx, StaticBlockObject &srcBlock,
+                       const AutoObjectVector &objects, JSScript *src);
 
 }  /* namespace js */
 

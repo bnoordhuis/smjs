@@ -41,8 +41,8 @@
 #define jsgc_barrier_h___
 
 #include "jsapi.h"
-#include "jscell.h"
 
+#include "gc/Heap.h"
 #include "js/HashTable.h"
 
 /*
@@ -140,36 +140,15 @@
  * and jsid, respectively.
  *
  * One additional note: not all object writes need to be barriered. Writes to
- * newly allocated objects do not need a barrier as long as the GC is not
- * allowed to run in between the allocation and the write. In these cases, we
- * use the "obj->field.init(value)" method instead of "obj->field = value".
- * We use the init naming idiom in many places to signify that a field is being
- * assigned for the first time, and that no GCs have taken place between the
- * object allocation and the assignment.
+ * newly allocated objects do not need a pre-barrier.  In these cases, we use
+ * the "obj->field.init(value)" method instead of "obj->field = value". We use
+ * the init naming idiom in many places to signify that a field is being
+ * assigned for the first time.
  */
 
 struct JSXML;
 
 namespace js {
-
-/*
- * Ideally, we would like to make the argument to functions like MarkShape be a
- * HeapPtr<const js::Shape>. That would ensure that we don't forget to
- * barrier any fields that we mark through. However, that would prohibit us from
- * passing in a derived class like HeapPtr<js::EmptyShape>.
- *
- * To overcome the problem, we make the argument to MarkShape be a
- * MarkablePtr<const js::Shape>. And we allow conversions from HeapPtr<T>
- * to MarkablePtr<U> as long as T can be converted to U.
- */
-template<class T>
-class MarkablePtr
-{
-  public:
-    T *value;
-
-    explicit MarkablePtr(T *value) : value(value) {}
-};
 
 template<class T, typename Unioned = uintptr_t>
 class HeapPtr
@@ -231,13 +210,6 @@ class HeapPtr
     T *operator->() const { return value; }
 
     operator T*() const { return value; }
-
-    /*
-     * This coerces to MarkablePtr<U> as long as T can coerce to U. See the
-     * comment for MarkablePtr above.
-     */
-    template<class U>
-    operator MarkablePtr<U>() const { return MarkablePtr<U>(value); }
 
   private:
     void pre() { T::writeBarrierPre(value); }
@@ -317,6 +289,9 @@ class EncapsulatedValue
     ~EncapsulatedValue() {}
 
   public:
+    inline bool operator==(const EncapsulatedValue &v) const { return value == v.value; }
+    inline bool operator!=(const EncapsulatedValue &v) const { return value != v.value; }
+
     const Value &get() const { return value; }
     Value *unsafeGet() { return &value; }
     operator const Value &() const { return value; }
@@ -390,6 +365,18 @@ class HeapValue : public EncapsulatedValue
     inline void post(JSCompartment *comp);
 };
 
+class RelocatableValue : public EncapsulatedValue
+{
+  public:
+    explicit inline RelocatableValue();
+    explicit inline RelocatableValue(const Value &v);
+    explicit inline RelocatableValue(const RelocatableValue &v);
+    inline ~RelocatableValue();
+
+    inline RelocatableValue &operator=(const Value &v);
+    inline RelocatableValue &operator=(const RelocatableValue &v);
+};
+
 class HeapSlot : public EncapsulatedValue
 {
     /*
@@ -420,6 +407,17 @@ class HeapSlot : public EncapsulatedValue
     inline void post(JSCompartment *comp, JSObject *owner, uint32_t slot);
 };
 
+/*
+ * NOTE: This is a placeholder for bug 619558.
+ *
+ * Run a post write barrier that encompasses multiple contiguous slots in a
+ * single step.
+ */
+static inline void
+SlotRangeWriteBarrierPost(JSCompartment *comp, JSObject *obj, uint32_t start, uint32_t count)
+{
+}
+
 static inline const Value *
 Valueify(const EncapsulatedValue *array)
 {
@@ -442,21 +440,20 @@ class HeapSlotArray
     HeapSlotArray operator +(uint32_t offset) const { return HeapSlotArray(array + offset); }
 };
 
-class HeapId
+class EncapsulatedId
 {
+  protected:
     jsid value;
 
+    explicit EncapsulatedId() : value(JSID_VOID) {}
+    explicit inline EncapsulatedId(jsid id) : value(id) {}
+    ~EncapsulatedId() {}
+
+  private:
+    EncapsulatedId(const EncapsulatedId &v) MOZ_DELETE;
+    EncapsulatedId &operator=(const EncapsulatedId &v) MOZ_DELETE;
+
   public:
-    explicit HeapId() : value(JSID_VOID) {}
-    explicit inline HeapId(jsid id);
-
-    inline ~HeapId();
-
-    inline void init(jsid id);
-
-    inline HeapId &operator=(jsid id);
-    inline HeapId &operator=(const HeapId &v);
-
     bool operator==(jsid id) const { return value == id; }
     bool operator!=(jsid id) const { return value != id; }
 
@@ -464,11 +461,37 @@ class HeapId
     jsid *unsafeGet() { return &value; }
     operator jsid() const { return value; }
 
-  private:
+  protected:
     inline void pre();
+};
+
+class RelocatableId : public EncapsulatedId
+{
+  public:
+    explicit RelocatableId() : EncapsulatedId() {}
+    explicit inline RelocatableId(jsid id) : EncapsulatedId(id) {}
+    inline ~RelocatableId();
+
+    inline RelocatableId &operator=(jsid id);
+    inline RelocatableId &operator=(const RelocatableId &v);
+};
+
+class HeapId : public EncapsulatedId
+{
+  public:
+    explicit HeapId() : EncapsulatedId() {}
+    explicit inline HeapId(jsid id);
+    inline ~HeapId();
+
+    inline void init(jsid id);
+
+    inline HeapId &operator=(jsid id);
+    inline HeapId &operator=(const HeapId &v);
+
+  private:
     inline void post();
 
-    HeapId(const HeapId &v);
+    HeapId(const HeapId &v) MOZ_DELETE;
 };
 
 /*
@@ -507,9 +530,6 @@ class ReadBarriered
     void set(T *v) { value = v; }
 
     operator bool() { return !!value; }
-
-    template<class U>
-    operator MarkablePtr<U>() const { return MarkablePtr<U>(value); }
 };
 
 class ReadBarrieredValue
@@ -526,6 +546,15 @@ class ReadBarrieredValue
     inline JSObject &toObject() const;
 };
 
-}
+namespace tl {
+
+template <class T> struct IsPostBarrieredType<HeapPtr<T> > {
+                                                    static const bool result = true; };
+template <> struct IsPostBarrieredType<HeapSlot>  { static const bool result = true; };
+template <> struct IsPostBarrieredType<HeapValue> { static const bool result = true; };
+template <> struct IsPostBarrieredType<HeapId>    { static const bool result = true; };
+
+} /* namespace tl */
+} /* namespace js */
 
 #endif /* jsgc_barrier_h___ */

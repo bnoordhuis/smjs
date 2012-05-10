@@ -42,12 +42,14 @@
 #define String_inl_h__
 
 #include "jscntxt.h"
-#include "jsgcmark.h"
 #include "jsprobes.h"
 
+#include "gc/Marking.h"
 #include "String.h"
 
 #include "jsgcinlines.h"
+#include "jsobjinlines.h"
+#include "gc/Barrier-inl.h"
 
 inline void
 JSString::writeBarrierPre(JSString *str)
@@ -115,7 +117,7 @@ JSRope::init(JSString *left, JSString *right, size_t length)
 }
 
 JS_ALWAYS_INLINE JSRope *
-JSRope::new_(JSContext *cx, JSString *left, JSString *right, size_t length)
+JSRope::new_(JSContext *cx, js::HandleString left, js::HandleString right, size_t length)
 {
     if (!validateLength(cx, length))
         return NULL;
@@ -136,6 +138,7 @@ JSRope::markChildren(JSTracer *trc)
 JS_ALWAYS_INLINE void
 JSDependentString::init(JSLinearString *base, const jschar *chars, size_t length)
 {
+    JS_ASSERT(!js::IsPoisonedPtr(base));
     d.lengthAndFlags = buildLengthAndFlags(length, DEPENDENT_BIT);
     d.u1.chars = chars;
     d.s.u2.base = base;
@@ -152,6 +155,15 @@ JSDependentString::new_(JSContext *cx, JSLinearString *base, const jschar *chars
     JS_ASSERT(base->isFlat());
     JS_ASSERT(chars >= base->chars() && chars < base->chars() + base->length());
     JS_ASSERT(length <= base->length() - (chars - base->chars()));
+
+    JS::Root<JSLinearString*> baseRoot(cx, &base);
+
+    /*
+     * The characters may be an internal pointer to a GC thing, so prevent them
+     * from being overwritten. For now this prevents strings used as dependent
+     * bases of other strings from being moved by the GC.
+     */
+    JS::SkipRoot charsRoot(cx, &chars);
 
     JSDependentString *str = (JSDependentString *)js_NewGCString(cx);
     if (!str)
@@ -386,19 +398,19 @@ js::StaticStrings::lookup(const jschar *chars, size_t length)
 }
 
 JS_ALWAYS_INLINE void
-JSString::finalize(JSContext *cx, bool background)
+JSString::finalize(js::FreeOp *fop)
 {
     /* Shorts are in a different arena. */
     JS_ASSERT(!isShort());
 
     if (isFlat())
-        asFlat().finalize(cx->runtime);
+        asFlat().finalize(fop);
     else
         JS_ASSERT(isDependent() || isRope());
 }
 
 inline void
-JSFlatString::finalize(JSRuntime *rt)
+JSFlatString::finalize(js::FreeOp *fop)
 {
     JS_ASSERT(!isShort());
 
@@ -407,33 +419,27 @@ JSFlatString::finalize(JSRuntime *rt)
      * beginning of inlineStorage. E.g., this is not the case for short strings.
      */
     if (chars() != d.inlineStorage)
-        rt->free_(const_cast<jschar *>(chars()));
+        fop->free_(const_cast<jschar *>(chars()));
 }
 
 inline void
-JSShortString::finalize(JSContext *cx, bool background)
+JSShortString::finalize(js::FreeOp *fop)
 {
     JS_ASSERT(JSString::isShort());
 }
 
 inline void
-JSAtom::finalize(JSRuntime *rt)
+JSAtom::finalize(js::FreeOp *fop)
 {
     JS_ASSERT(JSString::isAtom());
     if (getAllocKind() == js::gc::FINALIZE_STRING)
-        JSFlatString::finalize(rt);
+        JSFlatString::finalize(fop);
     else
         JS_ASSERT(getAllocKind() == js::gc::FINALIZE_SHORT_STRING);
 }
 
 inline void
-JSExternalString::finalize(JSContext *cx, bool background)
-{
-    finalize();
-}
-
-inline void
-JSExternalString::finalize()
+JSExternalString::finalize(js::FreeOp *fop)
 {
     const JSStringFinalizer *fin = externalFinalizer();
     fin->finalize(fin, const_cast<jschar *>(chars()));
@@ -444,6 +450,8 @@ namespace js {
 static JS_ALWAYS_INLINE JSFixedString *
 NewShortString(JSContext *cx, const jschar *chars, size_t length)
 {
+    SkipRoot skip(cx, &chars);
+
     /*
      * Don't bother trying to find a static atom; measurement shows that not
      * many get here (for one, Atomize is catching them).

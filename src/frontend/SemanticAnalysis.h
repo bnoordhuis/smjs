@@ -42,17 +42,17 @@
 
 namespace js {
 
-struct TreeContext;
+struct Parser;
 
 namespace frontend {
 
 /*
  * For each function in the compilation unit given by tc, decide whether the
- * function is a full closure, a null closure, or a flat closure, and set the
- * heavyweight bit if necessary.
+ * function is a full closure or a null closure and set JSFunction flags
+ * accordingly.
  */
 bool
-AnalyzeFunctions(TreeContext *tc);
+AnalyzeFunctions(Parser *parser);
 
 } /* namespace frontend */
 } /* namespace js */

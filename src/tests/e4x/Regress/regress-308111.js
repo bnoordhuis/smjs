@@ -1,3 +1,4 @@
+// |reftest| skip-if(!xulRuntime.shell&&isDebugBuild) slow
 /* -*- Mode: java; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /* ***** BEGIN LICENSE BLOCK *****
  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -630,7 +631,6 @@ var xml = <prefs>
 <pref><name>font.size.variable.x-guru</name></pref>
 <pref><name>font.size.variable.x-gujr</name></pref>
 <pref><name>network.protocol-handler.external.vnd.ms.radio</name></pref>
-<pref><name>advanced.system.supportDDEExec</name></pref>
 <pref><name>browser.tabs.opentabfor.urlbar</name></pref>
 <pref><name>font.name.sans-serif.x-khmr</name></pref>
 <pref><name>mousewheel.horizscroll.withshiftkey.sysnumlines</name></pref>

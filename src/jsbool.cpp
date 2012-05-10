@@ -40,6 +40,9 @@
 /*
  * JS boolean implementation.
  */
+
+#include "mozilla/FloatingPoint.h"
+
 #include "jstypes.h"
 #include "jsutil.h"
 #include "jsapi.h"
@@ -54,13 +57,13 @@
 #include "jsstr.h"
 
 #include "vm/GlobalObject.h"
+#include "vm/StringBuffer.h"
 
 #include "jsinferinlines.h"
 #include "jsobjinlines.h"
 
 #include "vm/BooleanObject-inl.h"
 #include "vm/MethodGuard-inl.h"
-#include "vm/StringBuffer-inl.h"
 
 using namespace js;
 using namespace js::types;
@@ -156,15 +159,15 @@ js_InitBooleanClass(JSContext *cx, JSObject *obj)
 {
     JS_ASSERT(obj->isNative());
 
-    GlobalObject *global = &obj->asGlobal();
+    RootedVar<GlobalObject*> global(cx, &obj->asGlobal());
 
-    JSObject *booleanProto = global->createBlankPrototype(cx, &BooleanClass);
+    RootedVarObject booleanProto (cx, global->createBlankPrototype(cx, &BooleanClass));
     if (!booleanProto)
         return NULL;
     booleanProto->setFixedSlot(BooleanObject::PRIMITIVE_VALUE_SLOT, BooleanValue(false));
 
-    JSFunction *ctor = global->createConstructor(cx, Boolean, &BooleanClass,
-                                                 CLASS_ATOM(cx, Boolean), 1);
+    RootedVarFunction ctor(cx);
+    ctor = global->createConstructor(cx, Boolean, CLASS_NAME(cx, Boolean), 1);
     if (!ctor)
         return NULL;
 
@@ -228,7 +231,7 @@ js_ValueToBoolean(const Value &v)
         double d;
 
         d = v.toDouble();
-        return !JSDOUBLE_IS_NaN(d) && d != 0;
+        return !MOZ_DOUBLE_IS_NaN(d) && d != 0;
     }
     JS_ASSERT(v.isBoolean());
     return v.toBoolean();

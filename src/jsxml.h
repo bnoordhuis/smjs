@@ -41,9 +41,9 @@
 
 #include "jspubtd.h"
 #include "jsobj.h"
-#include "jscell.h"
 
 #include "gc/Barrier.h"
+#include "gc/Heap.h"
 
 extern const char js_AnyName_str[];
 extern const char js_AttributeName_str[];
@@ -72,7 +72,7 @@ struct JSXMLArray
         cursors = NULL;
     }
 
-    void finish(JSContext *cx);
+    void finish(js::FreeOp *fop);
 
     bool setCapacity(JSContext *cx, uint32_t capacity);
     void trim();
@@ -203,7 +203,7 @@ struct JSXML : js::gc::Cell {
     void *pad;
 #endif
 
-    void finalize(JSContext *cx, bool background);
+    void finalize(js::FreeOp *fop);
 
     static void writeBarrierPre(JSXML *xml);
     static void writeBarrierPost(JSXML *xml, void *addr);
@@ -287,7 +287,7 @@ extern JSBool
 js_FindXMLProperty(JSContext *cx, const js::Value &nameval, JSObject **objp, jsid *idp);
 
 extern JSBool
-js_GetXMLMethod(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
+js_GetXMLMethod(JSContext *cx, js::HandleObject obj, jsid id, js::Value *vp);
 
 extern JSBool
 js_GetXMLDescendants(JSContext *cx, JSObject *obj, jsval id, jsval *vp);

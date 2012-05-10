@@ -42,6 +42,7 @@
 #define Stack_h__
 
 #include "jsfun.h"
+#include "jsautooplen.h"
 
 struct JSContext;
 struct JSCompartment;
@@ -71,7 +72,7 @@ class DummyFrameGuard;
 class GeneratorFrameGuard;
 
 class CallIter;
-class FrameRegsIter;
+class ScriptFrameIter;
 class AllFramesIter;
 
 class ArgumentsObject;
@@ -544,7 +545,7 @@ class StackFrame
 
     Value &varSlot(unsigned i) {
         JS_ASSERT(i < script()->nfixed);
-        JS_ASSERT_IF(maybeFun(), i < script()->bindings.countVars());
+        JS_ASSERT_IF(maybeFun(), i < script()->bindings.numVars());
         return slots()[i];
     }
 
@@ -582,7 +583,7 @@ class StackFrame
      *   for ( ...; fp; fp = fp->prev())
      *     ... fp->pcQuadratic(cx->stack);
      *
-     * Using next can avoid this, but in most cases prefer FrameRegsIter;
+     * Using next can avoid this, but in most cases prefer ScriptFrameIter;
      * it is amortized O(1).
      *
      *   When I get to the bottom I go back to the top of the stack
@@ -726,13 +727,21 @@ class StackFrame
     inline bool forEachCanonicalActualArg(Op op, unsigned start = 0, unsigned count = unsigned(-1));
     template <class Op> inline bool forEachFormalArg(Op op);
 
+    /* XXX: all these argsObj functions will be removed with bug 659577. */
+
     bool hasArgsObj() const {
+        /*
+         * HAS_ARGS_OBJ is still technically not equivalent to
+         * script()->needsArgsObj() during functionPrologue (where GC can
+         * observe a frame that needsArgsObj but has not yet been given the
+         * args). This can be fixed by creating and rooting the args/call
+         * object before pushing the frame, which should be done eventually.
+         */
         return !!(flags_ & HAS_ARGS_OBJ);
     }
 
     ArgumentsObject &argsObj() const {
         JS_ASSERT(hasArgsObj());
-        JS_ASSERT(!isEvalFrame());
         return *argsObj_;
     }
 
@@ -740,7 +749,12 @@ class StackFrame
         return hasArgsObj() ? &argsObj() : NULL;
     }
 
-    inline void setArgsObj(ArgumentsObject &obj);
+    void initArgsObj(ArgumentsObject &argsObj) {
+        JS_ASSERT(script()->needsArgsObj());
+        JS_ASSERT(!hasArgsObj());
+        argsObj_ = &argsObj;
+        flags_ |= HAS_ARGS_OBJ;
+    }
 
     /*
      * This value
@@ -783,8 +797,8 @@ class StackFrame
      * Callee
      *
      * Only function frames have a callee. An eval frame in a function has the
-     * same caller as its containing function frame. maybeCalleev can be used
-     * to return a value that is either caller object (for function frames) or
+     * same callee as its containing function frame. maybeCalleev can be used
+     * to return a value that is either the callee object (for function frames) or
      * null (for global frames).
      */
 
@@ -807,26 +821,12 @@ class StackFrame
         return calleev;
     }
 
-    /*
-     * Beware! Ad hoc changes can corrupt the stack layout; the callee should
-     * only be changed to something that is equivalent to the current callee in
-     * terms of numFormalArgs etc. Prefer overwriteCallee since it checks.
-     */
-    inline void overwriteCallee(JSObject &newCallee);
-
     Value &mutableCalleev() const {
         JS_ASSERT(isFunctionFrame());
         if (isEvalFrame())
             return ((Value *)this)[-2];
         return formalArgs()[-2];
     }
-
-    /*
-     * Compute the callee function for this stack frame, cloning if needed to
-     * implement the method read barrier.  If this is not a function frame,
-     * set *vp to null.
-     */
-    bool getValidCalleeObject(JSContext *cx, Value *vp);
 
     CallReceiver callReceiver() const {
         return CallReceiverFromArgv(formalArgs());
@@ -862,7 +862,8 @@ class StackFrame
      *   !fp->hasCall() && fp->scopeChain().isCall()
      */
 
-    inline JSObject &scopeChain() const;
+    inline HandleObject scopeChain() const;
+    inline GlobalObject &global() const;
 
     bool hasCallObj() const {
         bool ret = !!(flags_ & HAS_CALL_OBJ);
@@ -903,8 +904,8 @@ class StackFrame
     /*
      * Epilogue for function frames: put any args or call object for the frame
      * which may still be live, and maintain type nesting invariants. Note:
-     * this does not mark the epilogue as having been completed, since the
-     * frame is about to be popped. Use updateEpilogueFlags for this.
+     * this does mark the epilogue as having been completed, since the frame is
+     * about to be popped. Use updateEpilogueFlags for this.
      */
     inline void functionEpilogue();
 
@@ -1190,9 +1191,7 @@ class StackFrame
     }
 
 #ifdef JS_METHODJIT
-    mjit::JITScript *jit() {
-        return script()->getJIT(isConstructing());
-    }
+    inline mjit::JITScript *jit();
 #endif
 
     void methodjitStaticAsserts();
@@ -1288,12 +1287,24 @@ class FrameRegs
         fp_ = (StackFrame *) newfp;
     }
 
+    /* For EnterMethodJIT: */
+    void refreshFramePointer(StackFrame *fp) {
+        fp_ = fp;
+    }
+
     /* For stubs::CompileFunction, ContextStack: */
     void prepareToRun(StackFrame &fp, JSScript *script) {
         pc = script->code;
         sp = fp.slots() + script->nfixed;
         fp_ = &fp;
         inlined_ = NULL;
+    }
+
+    void setToEndOfScript() {
+        JSScript *script = fp()->script();
+        sp = fp()->base();
+        pc = script->code + script->length - JSOP_STOP_LENGTH;
+        JS_ASSERT(*pc == JSOP_STOP);
     }
 
     /* For pushDummyFrame: */
@@ -1693,9 +1704,10 @@ class ContextStack
 
     /* Get the topmost script and optional pc on the stack. */
     inline JSScript *currentScript(jsbytecode **pc = NULL) const;
+    inline JSScript *currentScriptWithDiagnostics(jsbytecode **pc = NULL) const;
 
     /* Get the scope chain for the topmost scripted call on the stack. */
-    inline JSObject *currentScriptedScopeChain() const;
+    inline HandleObject currentScriptedScopeChain() const;
 
     /*
      * Called by the methodjit for an arity mismatch. Arity mismatch can be
@@ -1818,6 +1830,7 @@ class StackIter
     StackSegment *seg_;
     Value        *sp_;
     jsbytecode   *pc_;
+    JSScript     *script_;
     CallArgs     args_;
 
     void poisonRegs();
@@ -1837,37 +1850,44 @@ class StackIter
     bool operator!=(const StackIter &rhs) const { return !(*this == rhs); }
 
     bool isScript() const { JS_ASSERT(!done()); return state_ == SCRIPTED; }
-    StackFrame *fp() const { JS_ASSERT(!done() && isScript()); return fp_; }
-    Value      *sp() const { JS_ASSERT(!done() && isScript()); return sp_; }
-    jsbytecode *pc() const { JS_ASSERT(!done() && isScript()); return pc_; }
+    bool isImplicitNativeCall() const {
+        JS_ASSERT(!done());
+        return state_ == IMPLICIT_NATIVE;
+    }
+    bool isNativeCall() const {
+        JS_ASSERT(!done());
+        return state_ == NATIVE || state_ == IMPLICIT_NATIVE;
+    }
 
-    bool isNativeCall() const { JS_ASSERT(!done()); return state_ != SCRIPTED; }
-    CallArgs nativeArgs() const { JS_ASSERT(!done() && isNativeCall()); return args_; }
+    bool isFunctionFrame() const;
+    bool isEvalFrame() const;
+    bool isNonEvalFunctionFrame() const;
+    bool isConstructing() const;
+
+    StackFrame *fp() const { JS_ASSERT(isScript()); return fp_; }
+    Value      *sp() const { JS_ASSERT(isScript()); return sp_; }
+    jsbytecode *pc() const { JS_ASSERT(isScript()); return pc_; }
+    JSScript   *script() const { JS_ASSERT(isScript()); return script_; }
+    JSFunction *callee() const;
+    Value       calleev() const;
+    Value       thisv() const;
+
+    CallArgs nativeArgs() const { JS_ASSERT(isNativeCall()); return args_; }
 };
 
 /* A filtering of the StackIter to only stop at scripts. */
-class FrameRegsIter
+class ScriptFrameIter : public StackIter
 {
-    StackIter iter_;
-
     void settle() {
-        while (!iter_.done() && !iter_.isScript())
-            ++iter_;
+        while (!done() && !isScript())
+            StackIter::operator++();
     }
 
   public:
-    FrameRegsIter(JSContext *cx, StackIter::SavedOption opt = StackIter::STOP_AT_SAVED)
-        : iter_(cx, opt) { settle(); }
+    ScriptFrameIter(JSContext *cx, StackIter::SavedOption opt = StackIter::STOP_AT_SAVED)
+        : StackIter(cx, opt) { settle(); }
 
-    bool done() const { return iter_.done(); }
-    FrameRegsIter &operator++() { ++iter_; settle(); return *this; }
-
-    bool operator==(const FrameRegsIter &rhs) const { return iter_ == rhs.iter_; }
-    bool operator!=(const FrameRegsIter &rhs) const { return iter_ != rhs.iter_; }
-
-    StackFrame *fp() const { return iter_.fp(); }
-    Value      *sp() const { return iter_.sp(); }
-    jsbytecode *pc() const { return iter_.pc(); }
+    ScriptFrameIter &operator++() { StackIter::operator++(); settle(); return *this; }
 };
 
 /*****************************************************************************/

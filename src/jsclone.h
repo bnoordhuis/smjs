@@ -143,6 +143,8 @@ struct JSStructuredCloneReader {
 
     // Any value passed to JS_ReadStructuredClone.
     void *closure;
+
+    friend JSBool JS_ReadTypedArray(JSStructuredCloneReader *r, jsval *vp);
 };
 
 struct JSStructuredCloneWriter {
@@ -173,6 +175,9 @@ struct JSStructuredCloneWriter {
     js::SCOutput &out;
 
     // Vector of objects with properties remaining to be written.
+    //
+    // NB: These can span multiple compartments, so the compartment must be
+    // entered before any manipulation is performed.
     js::AutoValueVector objs;
 
     // counts[i] is the number of properties of objs[i] remaining to be written.
@@ -193,6 +198,8 @@ struct JSStructuredCloneWriter {
 
     // Any value passed to JS_WriteStructuredClone.
     void *closure;
+
+    friend JSBool JS_WriteTypedArray(JSStructuredCloneWriter *w, jsval v);
 };
 
 #endif /* jsclone_h___ */

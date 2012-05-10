@@ -369,6 +369,8 @@ JSBool ExplicitConvert(JSContext* cx, jsval val, JSObject* targetType,
 
 enum CTypesGlobalSlot {
   SLOT_CALLBACKS = 0, // pointer to JSCTypesCallbacks struct
+  SLOT_ERRNO = 1,     // jsval for latest |errno|
+  SLOT_LASTERROR = 2, // jsval for latest |GetLastError|, used only with Windows
   CTYPESGLOBAL_SLOTS
 };
 
@@ -389,8 +391,9 @@ enum CTypeProtoSlot {
   SLOT_FUNCTIONDATAPROTO = 8,  // common ancestor of all CData objects of FunctionType
   SLOT_INT64PROTO        = 9,  // ctypes.Int64.prototype object
   SLOT_UINT64PROTO       = 10, // ctypes.UInt64.prototype object
-  SLOT_OURDATAPROTO      = 11, // the data prototype corresponding to this object
-  SLOT_CLOSURECX         = 12, // JSContext for use with FunctionType closures
+  SLOT_CTYPES            = 11, // ctypes object
+  SLOT_OURDATAPROTO      = 12, // the data prototype corresponding to this object
+  SLOT_CLOSURECX         = 13, // JSContext for use with FunctionType closures
   CTYPEPROTO_SLOTS
 };
 
@@ -425,6 +428,16 @@ enum CDataSlot {
 enum CClosureSlot {
   SLOT_CLOSUREINFO = 0, // ClosureInfo struct
   CCLOSURE_SLOTS
+};
+
+enum CDataFinalizerSlot {
+  // The type of the value (a CType JSObject).
+  // We hold it to permit ImplicitConvert and ToSource.
+  SLOT_DATAFINALIZER_VALTYPE           = 0,
+  // The type of the function used at finalization (a CType JSObject).
+  // We hold it to permit |ToSource|.
+  SLOT_DATAFINALIZER_CODETYPE          = 1,
+  CDATAFINALIZER_SLOTS
 };
 
 enum TypeCtorSlot {

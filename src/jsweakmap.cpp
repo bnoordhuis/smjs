@@ -45,9 +45,9 @@
 #include "jsfriendapi.h"
 #include "jsgc.h"
 #include "jsobj.h"
-#include "jsgcmark.h"
 #include "jsweakmap.h"
 
+#include "gc/Marking.h"
 #include "vm/GlobalObject.h"
 
 #include "jsgcinlines.h"
@@ -127,7 +127,7 @@ WeakMapBase::restoreWeakMapList(JSRuntime *rt, WeakMapVector &vector)
 
 } /* namespace js */
 
-typedef WeakMap<HeapPtr<JSObject>, HeapValue> ObjectValueMap;
+typedef WeakMap<HeapPtrObject, HeapValue> ObjectValueMap;
 
 static ObjectValueMap *
 GetObjectMap(JSObject *obj)
@@ -335,16 +335,16 @@ WeakMap_mark(JSTracer *trc, JSObject *obj)
 }
 
 static void
-WeakMap_finalize(JSContext *cx, JSObject *obj)
+WeakMap_finalize(FreeOp *fop, JSObject *obj)
 {
     if (ObjectValueMap *map = GetObjectMap(obj)) {
         map->check();
 #ifdef DEBUG
         map->~ObjectValueMap();
         memset(static_cast<void *>(map), 0xdc, sizeof(*map));
-        cx->free_(map);
+        fop->free_(map);
 #else
-        cx->delete_(map);
+        fop->delete_(map);
 #endif
     }
 }
@@ -392,14 +392,15 @@ js_InitWeakMapClass(JSContext *cx, JSObject *obj)
 {
     JS_ASSERT(obj->isNative());
 
-    GlobalObject *global = &obj->asGlobal();
+    RootedVar<GlobalObject*> global(cx, &obj->asGlobal());
 
-    JSObject *weakMapProto = global->createBlankPrototype(cx, &WeakMapClass);
+    RootedVarObject weakMapProto(cx, global->createBlankPrototype(cx, &WeakMapClass));
     if (!weakMapProto)
         return NULL;
 
-    JSFunction *ctor = global->createConstructor(cx, WeakMap_construct, &WeakMapClass,
-                                                 CLASS_ATOM(cx, WeakMap), 0);
+    RootedVarFunction ctor(cx);
+    ctor = global->createConstructor(cx, WeakMap_construct,
+                                     CLASS_NAME(cx, WeakMap), 0);
     if (!ctor)
         return NULL;
 

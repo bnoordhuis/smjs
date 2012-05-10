@@ -37,12 +37,14 @@
  *
  * ***** END LICENSE BLOCK ***** */
 
-#include "jsgcmark.h"
-
-#include "gc/Barrier.h"
-
 #ifndef jsgc_barrier_inl_h___
 #define jsgc_barrier_inl_h___
+
+#include "gc/Barrier.h"
+#include "gc/Marking.h"
+
+#include "vm/ObjectImpl-inl.h"
+#include "vm/String-inl.h"
 
 namespace js {
 
@@ -121,6 +123,7 @@ HeapValue::init(const Value &v)
 inline void
 HeapValue::init(JSCompartment *comp, const Value &v)
 {
+    JS_ASSERT(!IsPoisonedValue(v));
     value = v;
     post(comp);
 }
@@ -180,6 +183,50 @@ HeapValue::post()
 inline void
 HeapValue::post(JSCompartment *comp)
 {
+}
+
+inline
+RelocatableValue::RelocatableValue()
+    : EncapsulatedValue(UndefinedValue())
+{
+}
+
+inline
+RelocatableValue::RelocatableValue(const Value &v)
+    : EncapsulatedValue(v)
+{
+    JS_ASSERT(!IsPoisonedValue(v));
+}
+
+inline
+RelocatableValue::RelocatableValue(const RelocatableValue &v)
+    : EncapsulatedValue(v.value)
+{
+    JS_ASSERT(!IsPoisonedValue(v.value));
+}
+
+inline
+RelocatableValue::~RelocatableValue()
+{
+    pre();
+}
+
+inline RelocatableValue &
+RelocatableValue::operator=(const Value &v)
+{
+    pre();
+    JS_ASSERT(!IsPoisonedValue(v));
+    value = v;
+    return *this;
+}
+
+inline RelocatableValue &
+RelocatableValue::operator=(const RelocatableValue &v)
+{
+    pre();
+    JS_ASSERT(!IsPoisonedValue(v.value));
+    value = v.value;
+    return *this;
 }
 
 inline
@@ -265,9 +312,57 @@ HeapSlot::post(JSCompartment *comp, JSObject *owner, uint32_t slot)
     HeapSlot::writeBarrierPost(comp, owner, slot);
 }
 
+inline void
+EncapsulatedId::pre()
+{
+#ifdef JSGC_INCREMENTAL
+    if (JSID_IS_OBJECT(value)) {
+        JSObject *obj = JSID_TO_OBJECT(value);
+        JSCompartment *comp = obj->compartment();
+        if (comp->needsBarrier()) {
+            js::gc::MarkObjectUnbarriered(comp->barrierTracer(), &obj, "write barrier");
+            JS_ASSERT(obj == JSID_TO_OBJECT(value));
+        }
+    } else if (JSID_IS_STRING(value)) {
+        JSString *str = JSID_TO_STRING(value);
+        JSCompartment *comp = str->compartment();
+        if (comp->needsBarrier()) {
+            js::gc::MarkStringUnbarriered(comp->barrierTracer(), &str, "write barrier");
+            JS_ASSERT(str == JSID_TO_STRING(value));
+        }
+    }
+#endif
+}
+
+inline
+RelocatableId::~RelocatableId()
+{
+    pre();
+}
+
+inline RelocatableId &
+RelocatableId::operator=(jsid id)
+{
+    if (id != value)
+        pre();
+    JS_ASSERT(!IsPoisonedId(id));
+    value = id;
+    return *this;
+}
+
+inline RelocatableId &
+RelocatableId::operator=(const RelocatableId &v)
+{
+    if (v.value != value)
+        pre();
+    JS_ASSERT(!IsPoisonedId(v.value));
+    value = v.value;
+    return *this;
+}
+
 inline
 HeapId::HeapId(jsid id)
-    : value(id)
+    : EncapsulatedId(id)
 {
     JS_ASSERT(!IsPoisonedId(id));
     post();
@@ -288,21 +383,6 @@ HeapId::init(jsid id)
 }
 
 inline void
-HeapId::pre()
-{
-#ifdef JSGC_INCREMENTAL
-    if (JS_UNLIKELY(JSID_IS_OBJECT(value))) {
-        JSObject *obj = JSID_TO_OBJECT(value);
-        JSCompartment *comp = obj->compartment();
-        if (comp->needsBarrier()) {
-            js::gc::MarkObjectUnbarriered(comp->barrierTracer(), &obj, "write barrier");
-            JS_ASSERT(obj == JSID_TO_OBJECT(value));
-        }
-    }
-#endif
-}
-
-inline void
 HeapId::post()
 {
 }
@@ -310,7 +390,8 @@ HeapId::post()
 inline HeapId &
 HeapId::operator=(jsid id)
 {
-    pre();
+    if (id != value)
+        pre();
     JS_ASSERT(!IsPoisonedId(id));
     value = id;
     post();
@@ -320,7 +401,8 @@ HeapId::operator=(jsid id)
 inline HeapId &
 HeapId::operator=(const HeapId &v)
 {
-    pre();
+    if (v.value != value)
+        pre();
     JS_ASSERT(!IsPoisonedId(v.value));
     value = v.value;
     post();

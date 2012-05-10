@@ -260,23 +260,6 @@ TypeOfValue(JSContext *cx, const Value &v);
 extern JSBool
 HasInstance(JSContext *cx, JSObject *obj, const js::Value *v, JSBool *bp);
 
-extern bool
-ValueToId(JSContext *cx, const Value &v, jsid *idp);
-
-/*
- * @param closureLevel      The static level of the closure that the cookie
- *                          pertains to.
- * @param cookie            Level amount is a "skip" (delta) value from the
- *                          closure level.
- * @return  The value of the upvar.
- */
-extern const Value &
-GetUpvar(JSContext *cx, unsigned level, UpvarCookie cookie);
-
-/* Search the call stack for the nearest frame with static level targetLevel. */
-extern StackFrame *
-FindUpvarFrame(JSContext *cx, unsigned targetLevel);
-
 /*
  * A linked list of the |FrameRegs regs;| variables belonging to all
  * js::Interpret C++ frames on this thread's stack.
@@ -336,7 +319,7 @@ extern void
 UnwindForUncatchableException(JSContext *cx, const FrameRegs &regs);
 
 extern bool
-OnUnknownMethod(JSContext *cx, JSObject *obj, Value idval, Value *vp);
+OnUnknownMethod(JSContext *cx, HandleObject obj, Value idval, Value *vp);
 
 extern bool
 IsActiveWithOrBlock(JSContext *cx, JSObject &obj, uint32_t stackDepth);
@@ -385,22 +368,6 @@ Debug_SetValueRangeToCrashOnTouch(HeapValue *vec, size_t len)
 {
 #ifdef DEBUG
     Debug_SetValueRangeToCrashOnTouch((Value *) vec, len);
-#endif
-}
-
-static JS_ALWAYS_INLINE void
-Debug_SetSlotRangeToCrashOnTouch(HeapSlot *vec, size_t len)
-{
-#ifdef DEBUG
-    Debug_SetValueRangeToCrashOnTouch((Value *) vec, len);
-#endif
-}
-
-static JS_ALWAYS_INLINE void
-Debug_SetSlotRangeToCrashOnTouch(HeapSlot *begin, HeapSlot *end)
-{
-#ifdef DEBUG
-    Debug_SetValueRangeToCrashOnTouch((Value *) begin, end - begin);
 #endif
 }
 

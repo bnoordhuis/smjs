@@ -116,14 +116,9 @@ struct VMFrame
             void *ptr2;
         } x;
         struct {
-            uint32_t lazyArgsObj;
             uint32_t dynamicArgc;
         } call;
     } u;
-
-    static size_t offsetOfLazyArgsObj() {
-        return offsetof(VMFrame, u.call.lazyArgsObj);
-    }
 
     static size_t offsetOfDynamicArgc() {
         return offsetof(VMFrame, u.call.dynamicArgc);
@@ -454,33 +449,38 @@ enum JaegerStatus
      * The trap has been reinstalled, but should not execute again when
      * resuming execution.
      */
-    Jaeger_UnfinishedAtTrap = 3
+    Jaeger_UnfinishedAtTrap = 3,
+
+    /*
+     * An exception was thrown before entering jit code, so the caller should
+     * 'goto error'.
+     */
+    Jaeger_ThrowBeforeEnter = 4
 };
 
-/*
- * Method JIT compartment data. Currently, there is exactly one per
- * JS compartment. It would be safe for multiple JS compartments to
- * share a JaegerCompartment as long as only one thread can enter
- * the JaegerCompartment at a time.
- */
-class JaegerCompartment {
-    JSC::ExecutableAllocator *execAlloc_;    // allocator for jit code
+static inline bool
+JaegerStatusToSuccess(JaegerStatus status)
+{
+    JS_ASSERT(status != Jaeger_Unfinished);
+    JS_ASSERT(status != Jaeger_UnfinishedAtTrap);
+    return status == Jaeger_Returned;
+}
+
+/* Method JIT data associated with the JSRuntime. */
+class JaegerRuntime
+{
     Trampolines              trampolines;    // force-return trampolines
     VMFrame                  *activeFrame_;  // current active VMFrame
     JaegerStatus             lastUnfinished_;// result status of last VM frame,
                                              // if unfinished
 
-    void Finish();
+    void finish();
 
   public:
-    bool Initialize(JSContext *cx);
+    bool init(JSContext *cx);
 
-    JaegerCompartment();
-    ~JaegerCompartment() { Finish(); }
-
-    JSC::ExecutableAllocator *execAlloc() {
-        return execAlloc_;
-    }
+    JaegerRuntime();
+    ~JaegerRuntime() { finish(); }
 
     VMFrame *activeFrame() {
         return activeFrame_;
@@ -671,10 +671,12 @@ struct JITChunk
      * Therefore, do not change the section ordering in finishThisUp() without
      * changing nMICs() et al as well.
      */
-    uint32_t        nNmapPairs;         /* The NativeMapEntrys are sorted by .bcOff.
+    uint32_t        nNmapPairs : 31;    /* The NativeMapEntrys are sorted by .bcOff.
                                            .ncode values may not be NULL. */
     uint32_t        nInlineFrames;
     uint32_t        nCallSites;
+    uint32_t        nRootedTemplates;
+    uint32_t        nRootedRegExps;
 #ifdef JS_MONOIC
     uint32_t        nGetGlobalNames;
     uint32_t        nSetGlobalNames;
@@ -699,6 +701,8 @@ struct JITChunk
     NativeMapEntry *nmap() const;
     js::mjit::InlineFrame *inlineFrames() const;
     js::mjit::CallSite *callSites() const;
+    JSObject **rootedTemplates() const;
+    RegExpShared **rootedRegExps() const;
 #ifdef JS_MONOIC
     ic::GetGlobalNameIC *getGlobalNames() const;
     ic::SetGlobalNameIC *setGlobalNames() const;
@@ -717,12 +721,13 @@ struct JITChunk
         return jcheck >= jitcode && jcheck < jitcode + code.m_size;
     }
 
-    void nukeScriptDependentICs();
-
     size_t computedSizeOfIncludingThis();
     size_t sizeOfIncludingThis(JSMallocSizeOfFun mallocSizeOf);
 
     ~JITChunk();
+
+    void trace(JSTracer *trc);
+    void purgeCaches();
 
   private:
     /* Helpers used to navigate the variable-length sections. */
@@ -852,8 +857,11 @@ struct JITScript
 
     size_t sizeOfIncludingThis(JSMallocSizeOfFun mallocSizeOf);
 
-    void destroy(JSContext *cx);
-    void destroyChunk(JSContext *cx, unsigned chunkIndex, bool resetUses = true);
+    void destroy(FreeOp *fop);
+    void destroyChunk(FreeOp *fop, unsigned chunkIndex, bool resetUses = true);
+
+    void trace(JSTracer *trc);
+    void purgeCaches();
 };
 
 /*
@@ -892,16 +900,16 @@ CompileStatus
 CanMethodJIT(JSContext *cx, JSScript *script, jsbytecode *pc,
              bool construct, CompileRequest request);
 
-void
-ReleaseScriptCode(JSContext *cx, JSScript *script, bool construct);
-
 inline void
-ReleaseScriptCode(JSContext *cx, JSScript *script)
+ReleaseScriptCode(FreeOp *fop, JSScript *script)
 {
-    if (script->jitCtor)
-        mjit::ReleaseScriptCode(cx, script, true);
-    if (script->jitNormal)
-        mjit::ReleaseScriptCode(cx, script, false);
+    for (int constructing = 0; constructing <= 1; constructing++) {
+        for (int barriers = 0; barriers <= 1; barriers++) {
+            JSScript::JITScriptHandle *jith = script->jitHandle((bool) constructing, (bool) barriers);
+            if (jith && jith->isValid())
+                JSScript::ReleaseCode(fop, jith);
+        }
+    }
 }
 
 // Expand all stack frames inlined by the JIT within a compartment.
@@ -969,6 +977,17 @@ inline void * bsearch_nmap(NativeMapEntry *nmap, size_t nPairs, size_t bcOff)
     }
 }
 
+static inline bool
+IsLowerableFunCallOrApply(jsbytecode *pc)
+{
+#ifdef JS_MONOIC
+    return (*pc == JSOP_FUNCALL && GET_ARGC(pc) >= 1) ||
+           (*pc == JSOP_FUNAPPLY && GET_ARGC(pc) == 2);
+#else
+    return false;
+#endif
+}
+
 } /* namespace mjit */
 
 inline mjit::JITChunk *
@@ -1004,7 +1023,7 @@ VMFrame::pc()
 inline void *
 JSScript::nativeCodeForPC(bool constructing, jsbytecode *pc)
 {
-    js::mjit::JITScript *jit = getJIT(constructing);
+    js::mjit::JITScript *jit = getJIT(constructing, compartment()->needsBarrier());
     if (!jit)
         return NULL;
     js::mjit::JITChunk *chunk = jit->chunk(pc);

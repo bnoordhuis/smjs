@@ -41,10 +41,20 @@
 #define ParseNode_inl_h__
 
 #include "frontend/ParseNode.h"
-#include "frontend/BytecodeEmitter.h"
 #include "frontend/TokenStream.h"
+#include "frontend/TreeContext.h"
+
+#include "frontend/TreeContext-inl.h"
 
 namespace js {
+
+inline PropertyName *
+ParseNode::atom() const
+{
+    JS_ASSERT(isKind(PNK_FUNCTION) || isKind(PNK_NAME));
+    JSAtom *atom = isKind(PNK_FUNCTION) ? pn_funbox->function()->atom : pn_atom;
+    return atom->asPropertyName();
+}
 
 inline bool
 ParseNode::isConstant()

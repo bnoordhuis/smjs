@@ -23,6 +23,7 @@
  *
  * Contributor(s):
  *   Jeff Walden <jwalden+code@mit.edu> (original author)
+ *   Luke Wagner <luke@mozilla.com>
  *
  * Alternatively, the contents of this file may be used under the terms of
  * either of the GNU General Public License Version 2 or later (the "GPL"),
@@ -43,29 +44,7 @@
 
 #include "jsfun.h"
 
-#ifdef JS_POLYIC
-class GetPropCompiler;
-#endif
-
 namespace js {
-
-#ifdef JS_POLYIC
-struct VMFrame;
-namespace mjit {
-namespace ic {
-struct PICInfo;
-struct GetElementIC;
-
-/* Aargh, Windows. */
-#ifdef GetProp
-#undef GetProp
-#endif
-void JS_FASTCALL GetProp(VMFrame &f, ic::PICInfo *pic);
-}
-}
-#endif
-
-struct EmptyShape;
 
 /*
  * ArgumentsData stores the initial indexed arguments provided to the
@@ -81,6 +60,12 @@ struct ArgumentsData
      * been modified.
      */
     HeapValue   callee;
+
+    /*
+     * Pointer to an array of bits indicating, for every argument in 'slots',
+     * whether the element has been deleted. See isElementDeleted comment.
+     */
+    size_t      *deletedBits;
 
     /*
      * Values of the arguments for this object, or MagicValue(JS_ARGS_HOLE) if
@@ -147,31 +132,28 @@ class ArgumentsObject : public JSObject
     static const uint32_t DATA_SLOT = 1;
     static const uint32_t STACK_FRAME_SLOT = 2;
 
-  public:
-    static const uint32_t RESERVED_SLOTS = 3;
-    static const gc::AllocKind FINALIZE_KIND = gc::FINALIZE_OBJECT4;
-
-  private:
     /* Lower-order bit stolen from the length slot. */
     static const uint32_t LENGTH_OVERRIDDEN_BIT = 0x1;
     static const uint32_t PACKED_BITS_COUNT = 1;
 
-    /*
-     * Need access to DATA_SLOT, INITIAL_LENGTH_SLOT, LENGTH_OVERRIDDEN_BIT, and
-     * PACKED_BIT_COUNT.
-     */
-#ifdef JS_POLYIC
-    friend class ::GetPropCompiler;
-    friend struct mjit::ic::GetElementIC;
-#endif
-
     void initInitialLength(uint32_t length);
-
     void initData(ArgumentsData *data);
+    static ArgumentsObject *create(JSContext *cx, uint32_t argc, HandleObject callee);
 
   public:
-    /* Create an arguments object for the given callee function and frame. */
-    static ArgumentsObject *create(JSContext *cx, uint32_t argc, JSObject &callee);
+    static const uint32_t RESERVED_SLOTS = 3;
+    static const gc::AllocKind FINALIZE_KIND = gc::FINALIZE_OBJECT4;
+
+    /* Create an arguments object for a frame that is expecting them. */
+    static ArgumentsObject *create(JSContext *cx, StackFrame *fp);
+
+    /*
+     * Purposefully disconnect the returned arguments object from the frame
+     * by always creating a new copy that does not alias formal parameters.
+     * This allows function-local analysis to determine that formals are
+     * not aliased and generally simplifies arguments objects.
+     */
+    static ArgumentsObject *createUnexpected(JSContext *cx, StackFrame *fp);
 
     /*
      * Return the initial length of the arguments.  This may differ from the
@@ -206,8 +188,25 @@ class ArgumentsObject : public JSObject
 
     inline js::ArgumentsData *data() const;
 
+    /*
+     * Because the arguments object is a real object, its elements may be
+     * deleted. This is implemented by setting a 'deleted' flag for the arg
+     * which is read by argument object resolve and getter/setter hooks.
+     *
+     * NB: an element, once deleted, stays deleted. Thus:
+     *
+     *   function f(x) { delete arguments[0]; arguments[0] = 42; return x }
+     *   assertEq(f(1), 1);
+     *
+     * This works because, once a property is deleted from an arguments object,
+     * it gets regular properties with regular getters/setters that don't alias
+     * ArgumentsData::slots.
+     */
+    inline bool isElementDeleted(uint32_t i) const;
+    inline bool isAnyElementDeleted() const;
+    inline void markElementDeleted(uint32_t i);
+
     inline const js::Value &element(uint32_t i) const;
-    inline const js::Value *elements() const;
     inline void setElement(uint32_t i, const js::Value &v);
 
     /* The stack frame for this ArgumentsObject, if the frame is still active. */
@@ -223,11 +222,6 @@ class ArgumentsObject : public JSObject
 
 class NormalArgumentsObject : public ArgumentsObject
 {
-    friend bool JSObject::isNormalArguments() const;
-    friend struct EmptyShape; // for EmptyShape::getEmptyArgumentsShape
-    friend ArgumentsObject *
-    ArgumentsObject::create(JSContext *cx, uint32_t argc, JSObject &callee);
-
   public:
     /*
      * Stores arguments.callee, or MagicValue(JS_ARGS_HOLE) if the callee has
@@ -237,14 +231,17 @@ class NormalArgumentsObject : public ArgumentsObject
 
     /* Clear the location storing arguments.callee's initial value. */
     inline void clearCallee();
+
+    /*
+     * Return 'arguments[index]' for some unmodified NormalArgumentsObject of
+     * 'fp' (the actual instance of 'arguments' doesn't matter so it does not
+     * have to be passed or even created).
+     */
+    static bool optimizedGetElem(JSContext *cx, StackFrame *fp, const Value &elem, Value *vp);
 };
 
 class StrictArgumentsObject : public ArgumentsObject
-{
-    friend bool JSObject::isStrictArguments() const;
-    friend ArgumentsObject *
-    ArgumentsObject::create(JSContext *cx, uint32_t argc, JSObject &callee);
-};
+{};
 
 } // namespace js
 

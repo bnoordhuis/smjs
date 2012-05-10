@@ -217,33 +217,33 @@ Probes::JITWatcher::CollectNativeRegions(RegionVector &regions,
 }
 
 void
-Probes::registerMJITCode(JSContext *cx, js::mjit::JITScript *jscr,
+Probes::registerMJITCode(JSContext *cx, js::mjit::JITChunk *chunk,
                          js::mjit::JSActiveFrame *outerFrame,
                          js::mjit::JSActiveFrame **inlineFrames,
                          void *mainCodeAddress, size_t mainCodeSize,
                          void *stubCodeAddress, size_t stubCodeSize)
 {
     for (JITWatcher **p = jitWatchers.begin(); p != jitWatchers.end(); ++p)
-        (*p)->registerMJITCode(cx, jscr, outerFrame,
+        (*p)->registerMJITCode(cx, chunk, outerFrame,
                                inlineFrames,
                                mainCodeAddress, mainCodeSize,
                                stubCodeAddress, stubCodeSize);
 }
 
 void
-Probes::discardMJITCode(JSContext *cx, mjit::JITScript *jscr, JSScript *script, void* address)
+Probes::discardMJITCode(FreeOp *fop, mjit::JITScript *jscr, mjit::JITChunk *chunk, void* address)
 {
     for (JITWatcher **p = jitWatchers.begin(); p != jitWatchers.end(); ++p)
-        (*p)->discardMJITCode(cx, jscr, script, address);
+        (*p)->discardMJITCode(fop, jscr, chunk, address);
 }
 
 void
 Probes::registerICCode(JSContext *cx,
-                       mjit::JITScript *jscr, JSScript *script, jsbytecode* pc,
+                       mjit::JITChunk *chunk, JSScript *script, jsbytecode* pc,
                        void *start, size_t size)
 {
     for (JITWatcher **p = jitWatchers.begin(); p != jitWatchers.end(); ++p)
-        (*p)->registerICCode(cx, jscr, script, pc, start, size);
+        (*p)->registerICCode(cx, chunk, script, pc, start, size);
 }
 #endif
 
@@ -325,20 +325,9 @@ FunctionName(JSContext *cx, const JSFunction *fun, JSAutoByteString* bytes)
 {
     if (!fun)
         return Probes::nullName;
-    JSAtom *atom = const_cast<JSAtom*>(fun->atom);
-    if (!atom)
+    if (!fun->atom)
         return Probes::anonymousName;
-    return bytes->encode(cx, atom) ? bytes->ptr() : Probes::nullName;
-}
-
-static const char *
-FunctionClassname(const JSFunction *fun)
-{
-    if (!fun || fun->isInterpreted())
-        return Probes::nullName;
-    if (fun->getConstructorClass())
-        return fun->getConstructorClass()->name;
-    return Probes::nullName;
+    return bytes->encode(cx, fun->atom) ? bytes->ptr() : Probes::nullName;
 }
 
 /*
@@ -352,7 +341,7 @@ void
 Probes::DTraceEnterJSFun(JSContext *cx, JSFunction *fun, JSScript *script)
 {
     JSAutoByteString funNameBytes;
-    JAVASCRIPT_FUNCTION_ENTRY(ScriptFilename(script), FunctionClassname(fun),
+    JAVASCRIPT_FUNCTION_ENTRY(ScriptFilename(script), Probes::nullName,
                               FunctionName(cx, fun, &funNameBytes));
 }
 
@@ -360,7 +349,7 @@ void
 Probes::DTraceExitJSFun(JSContext *cx, JSFunction *fun, JSScript *script)
 {
     JSAutoByteString funNameBytes;
-    JAVASCRIPT_FUNCTION_RETURN(ScriptFilename(script), FunctionClassname(fun),
+    JAVASCRIPT_FUNCTION_RETURN(ScriptFilename(script), Probes::nullName,
                                FunctionName(cx, fun, &funNameBytes));
 }
 #endif

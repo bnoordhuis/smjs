@@ -69,6 +69,7 @@ CPPSRCS = \
   testGCOutOfMemory.cpp \
   testOOM.cpp \
   testGetPropertyDefault.cpp \
+  testHashTable.cpp \
   testIndexToString.cpp \
   testIntString.cpp \
   testIntTypesABI.cpp \
@@ -88,10 +89,12 @@ CPPSRCS = \
   testSetProperty.cpp \
   testStringBuffer.cpp \
   testTrap.cpp \
+  testTypedArrays.cpp \
   testUTF8.cpp \
   testValueABI.cpp \
   testVersion.cpp \
   testXDR.cpp \
+  testBindCallable.cpp \
   $(NULL)
 
 CSRCS = \

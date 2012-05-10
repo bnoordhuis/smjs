@@ -42,12 +42,10 @@
 #include "jscompartment.h"
 #include "jsiter.h"
 #include "jsscope.h"
-#if JS_HAS_XDR
-#include "jsxdrapi.h"
-#endif
 
 #include "GlobalObject.h"
 #include "ScopeObject.h"
+#include "Xdr.h"
 
 #include "jsatominlines.h"
 #include "jsobjinlines.h"
@@ -65,36 +63,29 @@ js_PutCallObject(StackFrame *fp)
     JS_ASSERT_IF(fp->isEvalFrame(), fp->isStrictEvalFrame());
     JS_ASSERT(fp->isEvalFrame() == callobj.isForEval());
 
-    /* Get the arguments object to snapshot fp's actual argument values. */
-    if (fp->hasArgsObj()) {
-        if (callobj.arguments().isMagic(JS_UNASSIGNED_ARGUMENTS))
-            callobj.setArguments(ObjectValue(fp->argsObj()));
-        js_PutArgsObject(fp);
-    }
-
     JSScript *script = fp->script();
     Bindings &bindings = script->bindings;
 
     if (callobj.isForEval()) {
         JS_ASSERT(script->strictModeCode);
-        JS_ASSERT(bindings.countArgs() == 0);
+        JS_ASSERT(bindings.numArgs() == 0);
 
         /* This could be optimized as below, but keep it simple for now. */
-        callobj.copyValues(0, NULL, bindings.countVars(), fp->slots());
+        callobj.copyValues(0, NULL, bindings.numVars(), fp->slots());
     } else {
         JSFunction *fun = fp->fun();
         JS_ASSERT(script == callobj.getCalleeFunction()->script());
         JS_ASSERT(script == fun->script());
 
-        unsigned n = bindings.countArgsAndVars();
+        unsigned n = bindings.count();
         if (n > 0) {
-            uint32_t nvars = bindings.countVars();
-            uint32_t nargs = bindings.countArgs();
+            uint32_t nvars = bindings.numVars();
+            uint32_t nargs = bindings.numArgs();
             JS_ASSERT(fun->nargs == nargs);
             JS_ASSERT(nvars + nargs == n);
 
             JSScript *script = fun->script();
-            if (script->usesEval
+            if (script->bindingsAccessedDynamically
 #ifdef JS_METHODJIT
                 || script->debugMode
 #endif
@@ -108,7 +99,7 @@ js_PutCallObject(StackFrame *fp)
                  * caches the return value in the slot, so we can't assert that
                  * it's undefined.
                  */
-                uint32_t nclosed = script->nClosedArgs;
+                uint32_t nclosed = script->numClosedArgs();
                 for (uint32_t i = 0; i < nclosed; i++) {
                     uint32_t e = script->getClosedArg(i);
 #ifdef JS_GC_ZEAL
@@ -118,7 +109,7 @@ js_PutCallObject(StackFrame *fp)
 #endif
                 }
 
-                nclosed = script->nClosedVars;
+                nclosed = script->numClosedVars();
                 for (uint32_t i = 0; i < nclosed; i++) {
                     uint32_t e = script->getClosedVar(i);
 #ifdef JS_GC_ZEAL
@@ -158,7 +149,7 @@ js_PutCallObject(StackFrame *fp)
  * must be null.
  */
 CallObject *
-CallObject::create(JSContext *cx, JSScript *script, JSObject &enclosing, JSObject *callee)
+CallObject::create(JSContext *cx, JSScript *script, HandleObject enclosing, HandleObject callee)
 {
     RootedVarShape shape(cx);
     shape = script->bindings.callObjectShape(cx);
@@ -168,7 +159,6 @@ CallObject::create(JSContext *cx, JSScript *script, JSObject &enclosing, JSObjec
     gc::AllocKind kind = gc::GetGCObjectKind(shape->numFixedSlots() + 1);
 
     RootedVarTypeObject type(cx);
-
     type = cx->compartment->getEmptyType(cx);
     if (!type)
         return NULL;
@@ -177,7 +167,7 @@ CallObject::create(JSContext *cx, JSScript *script, JSObject &enclosing, JSObjec
     if (!PreallocateObjectDynamicSlots(cx, shape, &slots))
         return NULL;
 
-    JSObject *obj = JSObject::create(cx, kind, shape, type, slots);
+    RootedVarObject obj(cx, JSObject::create(cx, kind, shape, type, slots));
     if (!obj)
         return NULL;
 
@@ -186,10 +176,9 @@ CallObject::create(JSContext *cx, JSScript *script, JSObject &enclosing, JSObjec
      * whose call objects do not have a consistent global variable and need
      * to be updated dynamically.
      */
-    JSObject &global = enclosing.global();
-    if (&global != obj->getParent()) {
+    if (&enclosing->global() != obj->getParent()) {
         JS_ASSERT(obj->getParent() == NULL);
-        if (!obj->setParent(cx, &global))
+        if (!JSObject::setParent(cx, obj, RootedVarObject(cx, &enclosing->global())))
             return NULL;
     }
 
@@ -209,14 +198,15 @@ CallObject::create(JSContext *cx, JSScript *script, JSObject &enclosing, JSObjec
 
     JS_ASSERT_IF(callee, callee->isFunction());
     obj->initFixedSlot(CALLEE_SLOT, ObjectOrNullValue(callee));
-    obj->initFixedSlot(ARGUMENTS_SLOT, MagicValue(JS_UNASSIGNED_ARGUMENTS));
 
     /*
      * If |bindings| is for a function that has extensible parents, that means
      * its Call should have its own shape; see BaseShape::extensibleParents.
      */
-    if (obj->lastProperty()->extensibleParents() && !obj->generateOwnShape(cx))
-        return NULL;
+    if (obj->lastProperty()->extensibleParents()) {
+        if (!obj->generateOwnShape(cx))
+            return NULL;
+    }
 
     return &obj->asCall();
 }
@@ -227,7 +217,7 @@ CallObject::createForFunction(JSContext *cx, StackFrame *fp)
     JS_ASSERT(fp->isNonEvalFunctionFrame());
     JS_ASSERT(!fp->hasCallObj());
 
-    JSObject *scopeChain = &fp->scopeChain();
+    RootedVarObject scopeChain(cx, fp->scopeChain());
     JS_ASSERT_IF(scopeChain->isWith() || scopeChain->isBlock() || scopeChain->isCall(),
                  scopeChain->getPrivate() != fp);
 
@@ -235,19 +225,20 @@ CallObject::createForFunction(JSContext *cx, StackFrame *fp)
      * For a named function expression Call's parent points to an environment
      * object holding function's name.
      */
-    if (JSAtom *lambdaName = CallObjectLambdaName(fp->fun())) {
+    RootedVarAtom lambdaName(cx, CallObjectLambdaName(fp->fun()));
+    if (lambdaName) {
         scopeChain = DeclEnvObject::create(cx, fp);
         if (!scopeChain)
             return NULL;
 
-        if (!DefineNativeProperty(cx, scopeChain, ATOM_TO_JSID(lambdaName),
+        if (!DefineNativeProperty(cx, scopeChain, AtomToId(lambdaName),
                                   ObjectValue(fp->callee()), NULL, NULL,
                                   JSPROP_PERMANENT | JSPROP_READONLY, 0, 0)) {
             return NULL;
         }
     }
 
-    CallObject *callobj = create(cx, fp->script(), *scopeChain, &fp->callee());
+    CallObject *callobj = create(cx, fp->script(), scopeChain, RootedVarObject(cx, &fp->callee()));
     if (!callobj)
         return NULL;
 
@@ -259,7 +250,7 @@ CallObject::createForFunction(JSContext *cx, StackFrame *fp)
 CallObject *
 CallObject::createForStrictEval(JSContext *cx, StackFrame *fp)
 {
-    CallObject *callobj = create(cx, fp->script(), fp->scopeChain(), NULL);
+    CallObject *callobj = create(cx, fp->script(), fp->scopeChain(), RootedVarObject(cx));
     if (!callobj)
         return NULL;
 
@@ -269,39 +260,15 @@ CallObject::createForStrictEval(JSContext *cx, StackFrame *fp)
 }
 
 JSBool
-CallObject::getArgumentsOp(JSContext *cx, JSObject *obj, jsid id, Value *vp)
-{
-    CallObject &callobj = obj->asCall();
-
-    StackFrame *fp = callobj.maybeStackFrame();
-    if (fp && callobj.arguments().isMagic(JS_UNASSIGNED_ARGUMENTS)) {
-        JSObject *argsobj = js_GetArgsObject(cx, fp);
-        if (!argsobj)
-            return false;
-        vp->setObject(*argsobj);
-    } else {
-        /* Nested functions cannot get the 'arguments' of enclosing scopes. */
-        JS_ASSERT(!callobj.arguments().isMagic(JS_UNASSIGNED_ARGUMENTS));
-        *vp = callobj.arguments();
-    }
-    return true;
-}
-
-JSBool
-CallObject::setArgumentsOp(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value *vp)
-{
-    /* Nested functions cannot set the 'arguments' of enclosing scopes. */
-    JS_ASSERT(obj->asCall().maybeStackFrame());
-    obj->asCall().setArguments(*vp);
-    return true;
-}
-
-JSBool
 CallObject::getArgOp(JSContext *cx, JSObject *obj, jsid id, Value *vp)
 {
     CallObject &callobj = obj->asCall();
+
     JS_ASSERT((int16_t) JSID_TO_INT(id) == JSID_TO_INT(id));
     unsigned i = (uint16_t) JSID_TO_INT(id);
+
+    DebugOnly<JSScript *> script = callobj.getCalleeFunction()->script();
+    JS_ASSERT_IF(!callobj.compartment()->debugMode(), script->argLivesInCallObject(i));
 
     if (StackFrame *fp = callobj.maybeStackFrame())
         *vp = fp->formalArg(i);
@@ -314,16 +281,18 @@ JSBool
 CallObject::setArgOp(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value *vp)
 {
     CallObject &callobj = obj->asCall();
+
     JS_ASSERT((int16_t) JSID_TO_INT(id) == JSID_TO_INT(id));
     unsigned i = (uint16_t) JSID_TO_INT(id);
+
+    JSScript *script = callobj.getCalleeFunction()->script();
+    JS_ASSERT_IF(!callobj.compartment()->debugMode(), script->argLivesInCallObject(i));
 
     if (StackFrame *fp = callobj.maybeStackFrame())
         fp->formalArg(i) = *vp;
     else
         callobj.setArg(i, *vp);
 
-    JSFunction *fun = callobj.getCalleeFunction();
-    JSScript *script = fun->script();
     if (!script->ensureHasTypes(cx))
         return false;
 
@@ -333,38 +302,25 @@ CallObject::setArgOp(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value
 }
 
 JSBool
-CallObject::getUpvarOp(JSContext *cx, JSObject *obj, jsid id, Value *vp)
-{
-    CallObject &callobj = obj->asCall();
-    JS_ASSERT((int16_t) JSID_TO_INT(id) == JSID_TO_INT(id));
-    unsigned i = (uint16_t) JSID_TO_INT(id);
-
-    *vp = callobj.getCallee()->toFunction()->getFlatClosureUpvar(i);
-    return true;
-}
-
-JSBool
-CallObject::setUpvarOp(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value *vp)
-{
-    CallObject &callobj = obj->asCall();
-    JS_ASSERT((int16_t) JSID_TO_INT(id) == JSID_TO_INT(id));
-    unsigned i = (uint16_t) JSID_TO_INT(id);
-
-    callobj.getCallee()->toFunction()->setFlatClosureUpvar(i, *vp);
-    return true;
-}
-
-JSBool
 CallObject::getVarOp(JSContext *cx, JSObject *obj, jsid id, Value *vp)
 {
     CallObject &callobj = obj->asCall();
+
     JS_ASSERT((int16_t) JSID_TO_INT(id) == JSID_TO_INT(id));
     unsigned i = (uint16_t) JSID_TO_INT(id);
+
+    DebugOnly<JSScript *> script = callobj.getCalleeFunction()->script();
+    JS_ASSERT_IF(!callobj.compartment()->debugMode(), script->varIsAliased(i));
 
     if (StackFrame *fp = callobj.maybeStackFrame())
         *vp = fp->varSlot(i);
     else
         *vp = callobj.var(i);
+
+    /* This can only happen via the debugger. Bug 659577 will remove it. */
+    if (vp->isMagic(JS_OPTIMIZED_ARGUMENTS))
+        *vp = UndefinedValue();
+
     return true;
 }
 
@@ -376,57 +332,34 @@ CallObject::setVarOp(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value
     JS_ASSERT((int16_t) JSID_TO_INT(id) == JSID_TO_INT(id));
     unsigned i = (uint16_t) JSID_TO_INT(id);
 
+    JSScript *script = callobj.getCalleeFunction()->script();
+    JS_ASSERT_IF(!callobj.compartment()->debugMode(), script->varIsAliased(i));
+
     if (StackFrame *fp = callobj.maybeStackFrame())
         fp->varSlot(i) = *vp;
     else
         callobj.setVar(i, *vp);
 
-    JSFunction *fun = callobj.getCalleeFunction();
-    JSScript *script = fun->script();
     if (!script->ensureHasTypes(cx))
         return false;
 
     TypeScript::SetLocal(cx, script, i, *vp);
-
     return true;
 }
 
-static JSBool
-call_resolve(JSContext *cx, JSObject *obj, jsid id, unsigned flags, JSObject **objp)
+bool
+CallObject::containsVarOrArg(PropertyName *name, Value *vp, JSContext *cx)
 {
-    JS_ASSERT(!obj->getProto());
+    jsid id = NameToId(name);
+    const Shape *shape = nativeLookup(cx, id);
+    if (!shape)
+        return false;
 
-    if (!JSID_IS_ATOM(id))
-        return true;
+    PropertyOp op = shape->getterOp();
+    if (op != getVarOp && op != getArgOp)
+        return false;
 
-    JSObject *callee = obj->asCall().getCallee();
-#ifdef DEBUG
-    if (callee) {
-        JSScript *script = callee->toFunction()->script();
-        JS_ASSERT(!script->bindings.hasBinding(cx, JSID_TO_ATOM(id)));
-    }
-#endif
-
-    /*
-     * Resolve arguments so that we never store a particular Call object's
-     * arguments object reference in a Call prototype's |arguments| slot.
-     *
-     * Include JSPROP_ENUMERATE for consistency with all other Call object
-     * properties; see js::Bindings::add and js::Interpret's JSOP_DEFFUN
-     * rebinding-Call-property logic.
-     */
-    if (callee && id == ATOM_TO_JSID(cx->runtime->atomState.argumentsAtom)) {
-        if (!DefineNativeProperty(cx, obj, id, UndefinedValue(),
-                                  CallObject::getArgumentsOp, CallObject::setArgumentsOp,
-                                  JSPROP_PERMANENT | JSPROP_SHARED | JSPROP_ENUMERATE,
-                                  0, 0, DNP_DONT_PURGE)) {
-            return false;
-        }
-        *objp = obj;
-        return true;
-    }
-
-    /* Control flow reaches here only if id was not resolved. */
+    JS_ALWAYS_TRUE(op(cx, this, INT_TO_JSID(shape->shortid()), vp));
     return true;
 }
 
@@ -445,15 +378,14 @@ call_trace(JSTracer *trc, JSObject *obj)
 
 JS_PUBLIC_DATA(Class) js::CallClass = {
     "Call",
-    JSCLASS_HAS_PRIVATE | JSCLASS_IMPLEMENTS_BARRIERS |
-    JSCLASS_HAS_RESERVED_SLOTS(CallObject::RESERVED_SLOTS) |
-    JSCLASS_NEW_RESOLVE | JSCLASS_IS_ANONYMOUS,
+    JSCLASS_HAS_PRIVATE | JSCLASS_IMPLEMENTS_BARRIERS | JSCLASS_IS_ANONYMOUS |
+    JSCLASS_HAS_RESERVED_SLOTS(CallObject::RESERVED_SLOTS),
     JS_PropertyStub,         /* addProperty */
     JS_PropertyStub,         /* delProperty */
     JS_PropertyStub,         /* getProperty */
     JS_StrictPropertyStub,   /* setProperty */
     JS_EnumerateStub,
-    (JSResolveOp)call_resolve,
+    JS_ResolveStub,
     NULL,                    /* convert: Leave it NULL so we notice if calls ever escape */
     NULL,                    /* finalize */
     NULL,                    /* checkAccess */
@@ -487,12 +419,11 @@ DeclEnvObject::create(JSContext *cx, StackFrame *fp)
 
     RootedVarShape emptyDeclEnvShape(cx);
     emptyDeclEnvShape = EmptyShape::getInitialShape(cx, &DeclEnvClass, NULL,
-                                                    &fp->scopeChain().global(),
-                                                    FINALIZE_KIND);
+                                                    &fp->global(), FINALIZE_KIND);
     if (!emptyDeclEnvShape)
         return NULL;
 
-    JSObject *obj = JSObject::create(cx, FINALIZE_KIND, emptyDeclEnvShape, type, NULL);
+    RootedVarObject obj(cx, JSObject::create(cx, FINALIZE_KIND, emptyDeclEnvShape, type, NULL));
     if (!obj)
         return NULL;
 
@@ -504,21 +435,21 @@ DeclEnvObject::create(JSContext *cx, StackFrame *fp)
 }
 
 WithObject *
-WithObject::create(JSContext *cx, StackFrame *fp, JSObject &proto, JSObject &enclosing,
+WithObject::create(JSContext *cx, StackFrame *fp, HandleObject proto, HandleObject enclosing,
                    uint32_t depth)
 {
     RootedVarTypeObject type(cx);
-    type = proto.getNewType(cx);
+    type = proto->getNewType(cx);
     if (!type)
         return NULL;
 
     RootedVarShape emptyWithShape(cx);
-    emptyWithShape = EmptyShape::getInitialShape(cx, &WithClass, &proto,
-                                                 &enclosing.global(), FINALIZE_KIND);
+    emptyWithShape = EmptyShape::getInitialShape(cx, &WithClass, proto,
+                                                 &enclosing->global(), FINALIZE_KIND);
     if (!emptyWithShape)
         return NULL;
 
-    JSObject *obj = JSObject::create(cx, FINALIZE_KIND, emptyWithShape, type, NULL);
+    RootedVarObject obj(cx, JSObject::create(cx, FINALIZE_KIND, emptyWithShape, type, NULL));
     if (!obj)
         return NULL;
 
@@ -528,7 +459,7 @@ WithObject::create(JSContext *cx, StackFrame *fp, JSObject &proto, JSObject &enc
     obj->setReservedSlot(DEPTH_SLOT, PrivateUint32Value(depth));
     obj->setPrivate(js_FloatingFrameIfGenerator(cx, fp));
 
-    JSObject *thisp = proto.thisObject(cx);
+    JSObject *thisp = proto->thisObject(cx);
     if (!thisp)
         return NULL;
 
@@ -552,7 +483,7 @@ with_LookupGeneric(JSContext *cx, JSObject *obj, jsid id, JSObject **objp, JSPro
 static JSBool
 with_LookupProperty(JSContext *cx, JSObject *obj, PropertyName *name, JSObject **objp, JSProperty **propp)
 {
-    return with_LookupGeneric(cx, obj, ATOM_TO_JSID(name), objp, propp);
+    return with_LookupGeneric(cx, obj, NameToId(name), objp, propp);
 }
 
 static JSBool
@@ -580,7 +511,7 @@ with_GetGeneric(JSContext *cx, JSObject *obj, JSObject *receiver, jsid id, Value
 static JSBool
 with_GetProperty(JSContext *cx, JSObject *obj, JSObject *receiver, PropertyName *name, Value *vp)
 {
-    return with_GetGeneric(cx, obj, receiver, ATOM_TO_JSID(name), vp);
+    return with_GetGeneric(cx, obj, receiver, NameToId(name), vp);
 }
 
 static JSBool
@@ -757,43 +688,41 @@ Class js::WithClass = {
         with_DeleteSpecial,
         with_Enumerate,
         with_TypeOf,
-        NULL,             /* fix   */
         with_ThisObject,
         NULL,             /* clear */
     }
 };
 
 ClonedBlockObject *
-ClonedBlockObject::create(JSContext *cx, StaticBlockObject &block, StackFrame *fp)
+ClonedBlockObject::create(JSContext *cx, Handle<StaticBlockObject*> block, StackFrame *fp)
 {
     RootedVarTypeObject type(cx);
-    type = block.getNewType(cx);
+    type = block->getNewType(cx);
     if (!type)
         return NULL;
 
     HeapSlot *slots;
-    if (!PreallocateObjectDynamicSlots(cx, block.lastProperty(), &slots))
+    if (!PreallocateObjectDynamicSlots(cx, block->lastProperty(), &slots))
         return NULL;
 
     RootedVarShape shape(cx);
-    shape = block.lastProperty();
+    shape = block->lastProperty();
 
-    JSObject *obj = JSObject::create(cx, FINALIZE_KIND, shape, type, slots);
+    RootedVarObject obj(cx, JSObject::create(cx, FINALIZE_KIND, shape, type, slots));
     if (!obj)
         return NULL;
 
     /* Set the parent if necessary, as for call objects. */
-    JSObject &global = fp->scopeChain().global();
-    if (&global != obj->getParent()) {
+    if (&fp->global() != obj->getParent()) {
         JS_ASSERT(obj->getParent() == NULL);
-        if (!obj->setParent(cx, &global))
+        if (!JSObject::setParent(cx, obj, RootedVarObject(cx, &fp->global())))
             return NULL;
     }
 
     JS_ASSERT(!obj->inDictionaryMode());
-    JS_ASSERT(obj->slotSpan() >= block.slotCount() + RESERVED_SLOTS);
+    JS_ASSERT(obj->slotSpan() >= block->slotCount() + RESERVED_SLOTS);
 
-    obj->setReservedSlot(DEPTH_SLOT, PrivateUint32Value(block.stackDepth()));
+    obj->setReservedSlot(DEPTH_SLOT, PrivateUint32Value(block->stackDepth()));
     obj->setPrivate(js_FloatingFrameIfGenerator(cx, fp));
 
     if (obj->lastProperty()->extensibleParents() && !obj->generateOwnShape(cx))
@@ -835,7 +764,8 @@ block_getProperty(JSContext *cx, JSObject *obj, jsid id, Value *vp)
      */
     ClonedBlockObject &block = obj->asClonedBlock();
     unsigned index = (unsigned) JSID_TO_INT(id);
-    JS_ASSERT(index < block.slotCount());
+
+    JS_ASSERT_IF(!block.compartment()->debugMode(), block.staticBlock().isAliased(index));
 
     if (StackFrame *fp = block.maybeStackFrame()) {
         fp = js_LiveFrameIfGenerator(fp);
@@ -855,7 +785,8 @@ block_setProperty(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value *v
 {
     ClonedBlockObject &block = obj->asClonedBlock();
     unsigned index = (unsigned) JSID_TO_INT(id);
-    JS_ASSERT(index < block.slotCount());
+
+    JS_ASSERT_IF(!block.compartment()->debugMode(), block.staticBlock().isAliased(index));
 
     if (StackFrame *fp = block.maybeStackFrame()) {
         fp = js_LiveFrameIfGenerator(fp);
@@ -869,6 +800,19 @@ block_setProperty(JSContext *cx, JSObject *obj, jsid id, JSBool strict, Value *v
      * The value in *vp will be written back to the slot in obj that was
      * allocated when this let binding was defined.
      */
+    return true;
+}
+
+bool
+ClonedBlockObject::containsVar(PropertyName *name, Value *vp, JSContext *cx)
+{
+    jsid id = NameToId(name);
+    const Shape *shape = nativeLookup(cx, id);
+    if (!shape)
+        return false;
+
+    JS_ASSERT(shape->getterOp() == block_getProperty);
+    JS_ALWAYS_TRUE(block_getProperty(cx, this, INT_TO_JSID(shape->shortid()), vp));
     return true;
 }
 
@@ -931,41 +875,45 @@ Class js::BlockClass = {
     JS_ConvertStub
 };
 
-#if JS_HAS_XDR
-
 #define NO_PARENT_INDEX UINT32_MAX
 
+/*
+ * If there's a parent id, then get the parent out of our script's object
+ * array. We know that we clone block objects in outer-to-inner order, which
+ * means that getting the parent now will work.
+ */
 static uint32_t
-FindObjectIndex(JSObjectArray *array, JSObject *obj)
+FindObjectIndex(JSScript *script, StaticBlockObject *maybeBlock)
 {
-    size_t i;
+    if (!maybeBlock || !script->hasObjects())
+        return NO_PARENT_INDEX;
 
-    if (array) {
-        i = array->length;
-        do {
-
-            if (array->vector[--i] == obj)
-                return i;
-        } while (i != 0);
+    ObjectArray *objects = script->objects();
+    HeapPtrObject *vector = objects->vector;
+    unsigned length = objects->length;
+    for (unsigned i = 0; i < length; ++i) {
+        if (vector[i] == maybeBlock)
+            return i;
     }
 
     return NO_PARENT_INDEX;
 }
 
+template<XDRMode mode>
 bool
-js::XDRStaticBlockObject(JSXDRState *xdr, JSScript *script, StaticBlockObject **objp)
+js::XDRStaticBlockObject(XDRState<mode> *xdr, JSScript *script, StaticBlockObject **objp)
 {
-    JSContext *cx = xdr->cx;
+    /* NB: Keep this in sync with CloneStaticBlockObject. */
+
+    JSContext *cx = xdr->cx();
 
     StaticBlockObject *obj = NULL;
     uint32_t parentId = 0;
     uint32_t count = 0;
     uint32_t depthAndCount = 0;
-    if (xdr->mode == JSXDR_ENCODE) {
+    if (mode == XDR_ENCODE) {
         obj = *objp;
-        parentId = JSScript::isValidOffset(script->objectsOffset)
-                   ? FindObjectIndex(script->objects(), obj->enclosingBlock())
-                   : NO_PARENT_INDEX;
+        parentId = FindObjectIndex(script, obj->enclosingBlock());
         uint32_t depth = obj->stackDepth();
         JS_ASSERT(depth <= UINT16_MAX);
         count = obj->slotCount();
@@ -974,20 +922,15 @@ js::XDRStaticBlockObject(JSXDRState *xdr, JSScript *script, StaticBlockObject **
     }
 
     /* First, XDR the parent atomid. */
-    if (!JS_XDRUint32(xdr, &parentId))
+    if (!xdr->codeUint32(&parentId))
         return false;
 
-    if (xdr->mode == JSXDR_DECODE) {
+    if (mode == XDR_DECODE) {
         obj = StaticBlockObject::create(cx);
         if (!obj)
             return false;
         *objp = obj;
 
-        /*
-         * If there's a parent id, then get the parent out of our script's
-         * object array. We know that we XDR block object in outer-to-inner
-         * order, which means that getting the parent now will work.
-         */
         obj->setEnclosingBlock(parentId == NO_PARENT_INDEX
                                ? NULL
                                : &script->getObject(parentId)->asStaticBlock());
@@ -995,10 +938,10 @@ js::XDRStaticBlockObject(JSXDRState *xdr, JSScript *script, StaticBlockObject **
 
     AutoObjectRooter tvr(cx, obj);
 
-    if (!JS_XDRUint32(xdr, &depthAndCount))
+    if (!xdr->codeUint32(&depthAndCount))
         return false;
 
-    if (xdr->mode == JSXDR_DECODE) {
+    if (mode == XDR_DECODE) {
         uint32_t depth = uint16_t(depthAndCount >> 16);
         count = uint16_t(depthAndCount);
         obj->setStackDepth(depth);
@@ -1009,12 +952,12 @@ js::XDRStaticBlockObject(JSXDRState *xdr, JSScript *script, StaticBlockObject **
          */
         for (unsigned i = 0; i < count; i++) {
             JSAtom *atom;
-            if (!js_XDRAtom(xdr, &atom))
+            if (!XDRAtom(xdr, &atom))
                 return false;
 
             /* The empty string indicates an int id. */
             jsid id = atom != cx->runtime->emptyString
-                      ? ATOM_TO_JSID(atom)
+                      ? AtomToId(atom)
                       : INT_TO_JSID(i);
 
             bool redeclared;
@@ -1022,10 +965,18 @@ js::XDRStaticBlockObject(JSXDRState *xdr, JSScript *script, StaticBlockObject **
                 JS_ASSERT(!redeclared);
                 return false;
             }
+
+            uint32_t aliased;
+            if (!xdr->codeUint32(&aliased))
+                return false;
+
+            JS_ASSERT(aliased == 0 || aliased == 1);
+            obj->setAliased(i, !!aliased);
         }
     } else {
         AutoShapeVector shapes(cx);
-        shapes.growBy(count);
+        if (!shapes.growBy(count))
+            return false;
 
         for (Shape::Range r(obj->lastProperty()); !r.empty(); r.popFront()) {
             const Shape *shape = &r.front();
@@ -1049,11 +1000,59 @@ js::XDRStaticBlockObject(JSXDRState *xdr, JSScript *script, StaticBlockObject **
                            ? JSID_TO_ATOM(propid)
                            : cx->runtime->emptyString;
 
-            if (!js_XDRAtom(xdr, &atom))
+            if (!XDRAtom(xdr, &atom))
+                return false;
+
+            uint32_t aliased = obj->isAliased(i);
+            if (!xdr->codeUint32(&aliased))
                 return false;
         }
     }
     return true;
 }
 
-#endif  /* JS_HAS_XDR */
+template bool
+js::XDRStaticBlockObject(XDRState<XDR_ENCODE> *xdr, JSScript *script, StaticBlockObject **objp);
+
+template bool
+js::XDRStaticBlockObject(XDRState<XDR_DECODE> *xdr, JSScript *script, StaticBlockObject **objp);
+
+JSObject *
+js::CloneStaticBlockObject(JSContext *cx, StaticBlockObject &srcBlock,
+                           const AutoObjectVector &objects, JSScript *src)
+{
+    /* NB: Keep this in sync with XDRStaticBlockObject. */
+
+    StaticBlockObject *clone = StaticBlockObject::create(cx);
+    if (!clone)
+        return NULL;
+
+    uint32_t parentId = FindObjectIndex(src, srcBlock.enclosingBlock());
+    clone->setEnclosingBlock(parentId == NO_PARENT_INDEX
+                             ? NULL
+                             : &objects[parentId]->asStaticBlock());
+
+    clone->setStackDepth(srcBlock.stackDepth());
+
+    /* Shape::Range is reverse order, so build a list in forward order. */
+    AutoShapeVector shapes(cx);
+    if (!shapes.growBy(srcBlock.slotCount()))
+        return NULL;
+    for (Shape::Range r = srcBlock.lastProperty()->all(); !r.empty(); r.popFront())
+        shapes[r.front().shortid()] = &r.front();
+
+    for (const Shape **p = shapes.begin(); p != shapes.end(); ++p) {
+        jsid id = (*p)->propid();
+        unsigned i = (*p)->shortid();
+
+        bool redeclared;
+        if (!clone->addVar(cx, id, i, &redeclared)) {
+            JS_ASSERT(!redeclared);
+            return NULL;
+        }
+
+        clone->setAliased(i, srcBlock.isAliased(i));
+    }
+
+    return clone;
+}

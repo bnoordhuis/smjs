@@ -41,7 +41,6 @@
 #include "jscntxt.h"
 #include "jscompartment.h"
 #include "jsgc.h"
-#include "jsgcmark.h"
 #include "jsiter.h"
 #include "jsmath.h"
 #include "jsproxy.h"
@@ -50,10 +49,12 @@
 #include "jswrapper.h"
 
 #include "assembler/wtf/Platform.h"
+#include "gc/Marking.h"
 #include "js/MemoryMetrics.h"
 #include "methodjit/MethodJIT.h"
 #include "methodjit/PolyIC.h"
 #include "methodjit/MonoIC.h"
+#include "methodjit/Retcon.h"
 #include "vm/Debugger.h"
 #include "yarr/BumpPointerAllocator.h"
 
@@ -73,15 +74,16 @@ JSCompartment::JSCompartment(JSRuntime *rt)
   : rt(rt),
     principals(NULL),
     needsBarrier_(false),
+    gcState(NoGCScheduled),
+    gcPreserveCode(false),
     gcBytes(0),
     gcTriggerBytes(0),
     hold(false),
+    lastCodeRelease(0),
     typeLifoAlloc(TYPE_LIFO_ALLOC_PRIMARY_CHUNK_SIZE),
     data(NULL),
     active(false),
-#ifdef JS_METHODJIT
-    jaegerCompartment_(NULL),
-#endif
+    lastAnimationTime(0),
     regExps(rt),
     propertyTree(thisForCtor()),
     emptyTypeObject(NULL),
@@ -89,26 +91,20 @@ JSCompartment::JSCompartment(JSRuntime *rt)
     gcTriggerMallocAndFreeBytes(0),
     gcMallocBytes(0),
     debugModeBits(rt->debugMode ? DebugFromC : 0),
-    mathCache(NULL),
-    watchpointMap(NULL)
+    watchpointMap(NULL),
+    scriptCountsMap(NULL),
+    sourceMapMap(NULL),
+    debugScriptMap(NULL)
 {
-    PodArrayZero(evalCache);
     setGCMaxMallocBytes(rt->gcMaxMallocBytes * 0.9);
 }
 
 JSCompartment::~JSCompartment()
 {
-#ifdef JS_METHODJIT
-    Foreground::delete_(jaegerCompartment_);
-#endif
-
-    Foreground::delete_(mathCache);
     Foreground::delete_(watchpointMap);
-
-#ifdef DEBUG
-    for (size_t i = 0; i < ArrayLength(evalCache); ++i)
-        JS_ASSERT(!evalCache[i]);
-#endif
+    Foreground::delete_(scriptCountsMap);
+    Foreground::delete_(sourceMapMap);
+    Foreground::delete_(debugScriptMap);
 }
 
 bool
@@ -117,51 +113,24 @@ JSCompartment::init(JSContext *cx)
     activeAnalysis = activeInference = false;
     types.init(cx);
 
-    newObjectCache.reset();
-
     if (!crossCompartmentWrappers.init())
         return false;
 
     if (!regExps.init(cx))
         return false;
 
-    if (!scriptFilenameTable.init())
-        return false;
-
     return debuggees.init();
 }
 
+void
+JSCompartment::setNeedsBarrier(bool needs)
+{
 #ifdef JS_METHODJIT
-bool
-JSCompartment::ensureJaegerCompartmentExists(JSContext *cx)
-{
-    if (jaegerCompartment_)
-        return true;
-
-    mjit::JaegerCompartment *jc = cx->new_<mjit::JaegerCompartment>();
-    if (!jc)
-        return false;
-    if (!jc->Initialize(cx)) {
-        cx->delete_(jc);
-        return false;
-    }
-    jaegerCompartment_ = jc;
-    return true;
-}
-
-size_t
-JSCompartment::sizeOfMjitCode() const
-{
-    if (!jaegerCompartment_)
-        return 0;
-
-    size_t method, regexp, unused;
-    jaegerCompartment_->execAlloc()->sizeOfCode(&method, &regexp, &unused);
-    JS_ASSERT(regexp == 0);
-    return method + unused;
-}
-
+    if (needsBarrier_ != needs)
+        mjit::ClearAllFrames(this);
 #endif
+    needsBarrier_ = needs;
+}
 
 bool
 JSCompartment::wrap(JSContext *cx, Value *vp)
@@ -197,9 +166,9 @@ JSCompartment::wrap(JSContext *cx, Value *vp)
      * we parent all wrappers to the global object in their home compartment.
      * This loses us some transparency, and is generally very cheesy.
      */
-    JSObject *global;
+    RootedVarObject global(cx);
     if (cx->hasfp()) {
-        global = &cx->fp()->scopeChain().global();
+        global = &cx->fp()->global();
     } else {
         global = JS_ObjectToInnerObject(cx, cx->globalObject);
         if (!global)
@@ -258,11 +227,11 @@ JSCompartment::wrap(JSContext *cx, Value *vp)
     if (WrapperMap::Ptr p = crossCompartmentWrappers.lookup(*vp)) {
         *vp = p->value;
         if (vp->isObject()) {
-            JSObject *obj = &vp->toObject();
+            RootedVarObject obj(cx, &vp->toObject());
             JS_ASSERT(obj->isCrossCompartmentWrapper());
             if (global->getClass() != &dummy_class && obj->getParent() != global) {
                 do {
-                    if (!obj->setParent(cx, global))
+                    if (!JSObject::setParent(cx, obj, global))
                         return false;
                     obj = obj->getProto();
                 } while (obj && obj->isCrossCompartmentWrapper());
@@ -272,7 +241,7 @@ JSCompartment::wrap(JSContext *cx, Value *vp)
     }
 
     if (vp->isString()) {
-        Value orig = *vp;
+        RootedVarValue orig(cx, *vp);
         JSString *str = vp->toString();
         const jschar *chars = str->getChars(cx);
         if (!chars)
@@ -284,7 +253,7 @@ JSCompartment::wrap(JSContext *cx, Value *vp)
         return crossCompartmentWrappers.put(orig, *vp);
     }
 
-    JSObject *obj = &vp->toObject();
+    RootedVarObject obj(cx, &vp->toObject());
 
     /*
      * Recurse to wrap the prototype. Long prototype chains will run out of
@@ -296,8 +265,8 @@ JSCompartment::wrap(JSContext *cx, Value *vp)
      * here (since Object.prototype->parent->proto leads to Object.prototype
      * itself).
      */
-    JSObject *proto = obj->getProto();
-    if (!wrap(cx, &proto))
+    RootedVarObject proto(cx, obj->getProto());
+    if (!wrap(cx, proto.address()))
         return false;
 
     /*
@@ -305,7 +274,7 @@ JSCompartment::wrap(JSContext *cx, Value *vp)
      * the wrap hook to reason over what wrappers are currently applied
      * to the object.
      */
-    JSObject *wrapper = cx->runtime->wrapObjectCallback(cx, obj, proto, global, flags);
+    RootedVarObject wrapper(cx, cx->runtime->wrapObjectCallback(cx, obj, proto, global, flags));
     if (!wrapper)
         return false;
 
@@ -317,7 +286,7 @@ JSCompartment::wrap(JSContext *cx, Value *vp)
     if (!crossCompartmentWrappers.put(GetProxyPrivate(wrapper), *vp))
         return false;
 
-    if (!wrapper->setParent(cx, global))
+    if (!JSObject::setParent(cx, wrapper, global))
         return false;
     return true;
 }
@@ -325,20 +294,20 @@ JSCompartment::wrap(JSContext *cx, Value *vp)
 bool
 JSCompartment::wrap(JSContext *cx, JSString **strp)
 {
-    AutoValueRooter tvr(cx, StringValue(*strp));
-    if (!wrap(cx, tvr.addr()))
+    RootedVarValue value(cx, StringValue(*strp));
+    if (!wrap(cx, value.address()))
         return false;
-    *strp = tvr.value().toString();
+    *strp = value.reference().toString();
     return true;
 }
 
 bool
 JSCompartment::wrap(JSContext *cx, HeapPtrString *strp)
 {
-    AutoValueRooter tvr(cx, StringValue(*strp));
-    if (!wrap(cx, tvr.addr()))
+    RootedVarValue value(cx, StringValue(*strp));
+    if (!wrap(cx, value.address()))
         return false;
-    *strp = tvr.value().toString();
+    *strp = value.reference().toString();
     return true;
 }
 
@@ -347,10 +316,10 @@ JSCompartment::wrap(JSContext *cx, JSObject **objp)
 {
     if (!*objp)
         return true;
-    AutoValueRooter tvr(cx, ObjectValue(**objp));
-    if (!wrap(cx, tvr.addr()))
+    RootedVarValue value(cx, ObjectValue(**objp));
+    if (!wrap(cx, value.address()))
         return false;
-    *objp = &tvr.value().toObject();
+    *objp = &value.reference().toObject();
     return true;
 }
 
@@ -359,10 +328,10 @@ JSCompartment::wrapId(JSContext *cx, jsid *idp)
 {
     if (JSID_IS_INT(*idp))
         return true;
-    AutoValueRooter tvr(cx, IdToValue(*idp));
-    if (!wrap(cx, tvr.addr()))
+    RootedVarValue value(cx, IdToValue(*idp));
+    if (!wrap(cx, value.address()))
         return false;
-    return ValueToId(cx, tvr.value(), idp);
+    return ValueToId(cx, value.reference(), idp);
 }
 
 bool
@@ -414,7 +383,7 @@ JSCompartment::wrap(JSContext *cx, AutoIdVector &props)
 void
 JSCompartment::markCrossCompartmentWrappers(JSTracer *trc)
 {
-    JS_ASSERT(trc->runtime->gcCurrentCompartment);
+    JS_ASSERT(!isCollecting());
 
     for (WrapperMap::Enum e(crossCompartmentWrappers); !e.empty(); e.popFront()) {
         Value tmp = e.front().key;
@@ -431,7 +400,7 @@ JSCompartment::markTypes(JSTracer *trc)
      * compartment. These can be referred to directly by type sets, which we
      * cannot modify while code which depends on these type sets is active.
      */
-    JS_ASSERT(activeAnalysis);
+    JS_ASSERT(activeAnalysis || gcPreserveCode);
 
     for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
         JSScript *script = i.get<JSScript>();
@@ -459,31 +428,50 @@ JSCompartment::markTypes(JSTracer *trc)
 }
 
 void
-JSCompartment::discardJitCode(JSContext *cx)
+JSCompartment::discardJitCode(FreeOp *fop)
 {
+#ifdef JS_METHODJIT
+
     /*
      * Kick all frames on the stack into the interpreter, and release all JIT
-     * code in the compartment.
+     * code in the compartment unless gcPreserveCode is set, in which case
+     * purge all caches in the JIT scripts. Even if we are not releasing all
+     * JIT code, we still need to release code for scripts which are in the
+     * middle of a native or getter stub call, as these stubs will have been
+     * redirected to the interpoline.
      */
-#ifdef JS_METHODJIT
     mjit::ClearAllFrames(this);
 
-    for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
-        JSScript *script = i.get<JSScript>();
-        mjit::ReleaseScriptCode(cx, script);
+    if (gcPreserveCode) {
+        for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
+            JSScript *script = i.get<JSScript>();
+            for (int constructing = 0; constructing <= 1; constructing++) {
+                for (int barriers = 0; barriers <= 1; barriers++) {
+                    mjit::JITScript *jit = script->getJIT((bool) constructing, (bool) barriers);
+                    if (jit)
+                        jit->purgeCaches();
+                }
+            }
+        }
+    } else {
+        for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
+            JSScript *script = i.get<JSScript>();
+            mjit::ReleaseScriptCode(fop, script);
 
-        /*
-         * Use counts for scripts are reset on GC. After discarding code we
-         * need to let it warm back up to get information like which opcodes
-         * are setting array holes or accessing getter properties.
-         */
-        script->resetUseCount();
+            /*
+             * Use counts for scripts are reset on GC. After discarding code we
+             * need to let it warm back up to get information such as which
+             * opcodes are setting array holes or accessing getter properties.
+             */
+            script->resetUseCount();
+        }
     }
-#endif
+
+#endif /* JS_METHODJIT */
 }
 
 void
-JSCompartment::sweep(JSContext *cx, bool releaseTypes)
+JSCompartment::sweep(FreeOp *fop, bool releaseTypes)
 {
     /* Remove dead wrappers from the table. */
     for (WrapperMap::Enum e(crossCompartmentWrappers); !e.empty(); e.popFront()) {
@@ -498,26 +486,25 @@ JSCompartment::sweep(JSContext *cx, bool releaseTypes)
 
     /* Remove dead references held weakly by the compartment. */
 
-    regExps.sweep(rt);
-
-    sweepBaseShapeTable(cx);
-    sweepInitialShapeTable(cx);
-    sweepNewTypeObjectTable(cx, newTypeObjects);
-    sweepNewTypeObjectTable(cx, lazyTypeObjects);
+    sweepBaseShapeTable();
+    sweepInitialShapeTable();
+    sweepNewTypeObjectTable(newTypeObjects);
+    sweepNewTypeObjectTable(lazyTypeObjects);
 
     if (emptyTypeObject && IsAboutToBeFinalized(emptyTypeObject))
         emptyTypeObject = NULL;
 
-    newObjectCache.reset();
-
-    sweepBreakpoints(cx);
+    sweepBreakpoints(fop);
 
     {
         gcstats::AutoPhase ap(rt->gcStats, gcstats::PHASE_DISCARD_CODE);
-        discardJitCode(cx);
+        discardJitCode(fop);
     }
 
-    if (!activeAnalysis) {
+    /* JIT code can hold references on RegExpShared, so sweep regexps after clearing code. */
+    regExps.sweep(rt);
+
+    if (!activeAnalysis && !gcPreserveCode) {
         gcstats::AutoPhase ap(rt->gcStats, gcstats::PHASE_DISCARD_ANALYSIS);
 
         /*
@@ -540,10 +527,12 @@ JSCompartment::sweep(JSContext *cx, bool releaseTypes)
          * enabled in the compartment.
          */
         if (types.inferenceEnabled) {
+            gcstats::AutoPhase ap2(rt->gcStats, gcstats::PHASE_DISCARD_TI);
+
             for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
                 JSScript *script = i.get<JSScript>();
                 if (script->types) {
-                    types::TypeScript::Sweep(cx, script);
+                    types::TypeScript::Sweep(fop, script);
 
                     if (releaseTypes) {
                         script->types->destroy();
@@ -554,11 +543,17 @@ JSCompartment::sweep(JSContext *cx, bool releaseTypes)
             }
         }
 
-        types.sweep(cx);
+        {
+            gcstats::AutoPhase ap2(rt->gcStats, gcstats::PHASE_SWEEP_TYPES);
+            types.sweep(fop);
+        }
 
-        for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
-            JSScript *script = i.get<JSScript>();
-            script->clearAnalysis();
+        {
+            gcstats::AutoPhase ap2(rt->gcStats, gcstats::PHASE_CLEAR_SCRIPT_ANALYSIS);
+            for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
+                JSScript *script = i.get<JSScript>();
+                script->clearAnalysis();
+            }
         }
     }
 
@@ -569,40 +564,18 @@ void
 JSCompartment::purge()
 {
     dtoaCache.purge();
-
-    /*
-     * Clear the hash and reset all evalHashLink to null before the GC. This
-     * way MarkChildren(trc, JSScript *) can assume that JSScript::u.object is
-     * not null when we have script owned by an object and not from the eval
-     * cache.
-     */
-    for (size_t i = 0; i < ArrayLength(evalCache); ++i) {
-        for (JSScript **listHeadp = &evalCache[i]; *listHeadp; ) {
-            JSScript *script = *listHeadp;
-            JS_ASSERT(GetGCThingTraceKind(script) == JSTRACE_SCRIPT);
-            *listHeadp = NULL;
-            listHeadp = &script->evalHashLink();
-        }
-    }
-
-    nativeIterCache.purge();
-    toSourceCache.destroyIfConstructed();
 }
 
 void
 JSCompartment::resetGCMallocBytes()
 {
-    gcMallocBytes = ptrdiff_t(gcMaxMallocBytes);
+    gcMallocBytes = gcMaxMallocBytes;
 }
 
 void
 JSCompartment::setGCMaxMallocBytes(size_t value)
 {
-    /*
-     * For compatibility treat any value that exceeds PTRDIFF_T_MAX to
-     * mean that value.
-     */
-    gcMaxMallocBytes = (ptrdiff_t(value) >= 0) ? value : size_t(-1) >> 1;
+    gcMaxMallocBytes = value;
     resetGCMallocBytes();
 }
 
@@ -612,16 +585,6 @@ JSCompartment::onTooMuchMalloc()
     TriggerCompartmentGC(this, gcreason::TOO_MUCH_MALLOC);
 }
 
-
-MathCache *
-JSCompartment::allocMathCache(JSContext *cx)
-{
-    JS_ASSERT(!mathCache);
-    mathCache = cx->new_<MathCache>();
-    if (!mathCache)
-        js_ReportOutOfMemory(cx);
-    return mathCache;
-}
 
 bool
 JSCompartment::hasScriptsOnStack()
@@ -662,12 +625,12 @@ JSCompartment::setDebugModeFromC(JSContext *cx, bool b)
     debugModeBits = (debugModeBits & ~unsigned(DebugFromC)) | (b ? DebugFromC : 0);
     JS_ASSERT(debugMode() == enabledAfter);
     if (enabledBefore != enabledAfter)
-        updateForDebugMode(cx);
+        updateForDebugMode(cx->runtime->defaultFreeOp());
     return true;
 }
 
 void
-JSCompartment::updateForDebugMode(JSContext *cx)
+JSCompartment::updateForDebugMode(FreeOp *fop)
 {
     for (ContextIter acx(rt); !acx.done(); acx.next()) {
         if (acx->compartment == this) 
@@ -682,17 +645,19 @@ JSCompartment::updateForDebugMode(JSContext *cx)
     else if (hasScriptsOnStack())
         return;
 
-    /*
-     * Discard JIT code and bytecode analyses for any scripts that change
-     * debugMode.
-     */
     for (gc::CellIter i(this, gc::FINALIZE_SCRIPT); !i.done(); i.next()) {
         JSScript *script = i.get<JSScript>();
-        if (script->debugMode != enabled) {
-            mjit::ReleaseScriptCode(cx, script);
-            script->clearAnalysis();
-            script->debugMode = enabled;
-        }
+        mjit::ReleaseScriptCode(fop, script);
+        script->debugMode = enabled;
+    }
+
+    // Discard JIT code and bytecode analysis for all scripts in this
+    // compartment. Because !hasScriptsOnStack(), it suffices to do a garbage
+    // collection cycle or to finish the ongoing GC cycle. The necessary
+    // cleanup happens in JSCompartment::sweep.
+    if (!rt->gcRunning) {
+        PrepareCompartmentForGC(this);
+        GC(rt, GC_NORMAL, gcreason::DEBUG_MODE_GC);
     }
 #endif
 }
@@ -707,12 +672,12 @@ JSCompartment::addDebuggee(JSContext *cx, js::GlobalObject *global)
     }
     debugModeBits |= DebugFromJS;
     if (!wasEnabled)
-        updateForDebugMode(cx);
+        updateForDebugMode(cx->runtime->defaultFreeOp());
     return true;
 }
 
 void
-JSCompartment::removeDebuggee(JSContext *cx,
+JSCompartment::removeDebuggee(FreeOp *fop,
                               js::GlobalObject *global,
                               js::GlobalObjectSet::Enum *debuggeesEnum)
 {
@@ -726,34 +691,34 @@ JSCompartment::removeDebuggee(JSContext *cx,
     if (debuggees.empty()) {
         debugModeBits &= ~DebugFromJS;
         if (wasEnabled && !debugMode())
-            updateForDebugMode(cx);
+            updateForDebugMode(fop);
     }
 }
 
 void
-JSCompartment::clearBreakpointsIn(JSContext *cx, js::Debugger *dbg, JSObject *handler)
+JSCompartment::clearBreakpointsIn(FreeOp *fop, js::Debugger *dbg, JSObject *handler)
 {
     for (gc::CellIter i(this, gc::FINALIZE_SCRIPT); !i.done(); i.next()) {
         JSScript *script = i.get<JSScript>();
         if (script->hasAnyBreakpointsOrStepMode())
-            script->clearBreakpointsIn(cx, dbg, handler);
+            script->clearBreakpointsIn(fop, dbg, handler);
     }
 }
 
 void
-JSCompartment::clearTraps(JSContext *cx)
+JSCompartment::clearTraps(FreeOp *fop)
 {
     for (gc::CellIter i(this, gc::FINALIZE_SCRIPT); !i.done(); i.next()) {
         JSScript *script = i.get<JSScript>();
         if (script->hasAnyBreakpointsOrStepMode())
-            script->clearTraps(cx);
+            script->clearTraps(fop);
     }
 }
 
 void
-JSCompartment::sweepBreakpoints(JSContext *cx)
+JSCompartment::sweepBreakpoints(FreeOp *fop)
 {
-    if (JS_CLIST_IS_EMPTY(&cx->runtime->debuggerList))
+    if (JS_CLIST_IS_EMPTY(&rt->debuggerList))
         return;
 
     for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
@@ -771,7 +736,7 @@ JSCompartment::sweepBreakpoints(JSContext *cx)
             for (Breakpoint *bp = site->firstBreakpoint(); bp; bp = nextbp) {
                 nextbp = bp->nextInSite();
                 if (scriptGone || IsAboutToBeFinalized(bp->debugger->toJSObject()))
-                    bp->destroy(cx);
+                    bp->destroy(fop);
             }
         }
     }
